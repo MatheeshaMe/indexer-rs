@@ -1,5 +1,5 @@
 use std::{
-    env, error::Error, fmt::format, future::Future, pin::Pin, str::FromStr, task::{Context, Poll}
+    env,future::Future, pin::Pin, str::FromStr, task::{Context, Poll}
 };
 
 use alloy::{
@@ -58,14 +58,14 @@ pub async fn fetch_and_save_logs(
         0 => 0, // FIXME: may start from the first tx block
         block_number => block_number + 1_u64,
     };
-    let max_range:u64 =10;
+    let max_range =10;
     let to_block_number = match sync_log.last_synced_block_number as u64 {
         0 => latest_block,
         block_number => std::cmp::min(block_number + max_range, latest_block),
     };
 
     let filter = Filter::new()
-        .address(Address::from_str(&address).map_err(|e| AppError::InvalidAddress(format!("Invalid address {}",e)))?)
+        .address(Address::from_str(&address).map_err(|e| AppError::InvalidAddress(format!("Invalid Address {}",e)))?)
         .from_block(BlockNumberOrTag::Number(from_block_number))
         .to_block(BlockNumberOrTag::Number(to_block_number));
 
@@ -73,22 +73,16 @@ pub async fn fetch_and_save_logs(
 
     let mut tx = db_pool.begin().await?;
     for log in logs {
-        let _ = EvmLogs::create(log, &mut *tx)
-            .await
-            .inspect_err(|error| eprintln!("Error saving log {error}"));
+       EvmLogs::create(log, &mut *tx)
+            .await.map_err(|e| AppError::EVMLog(format!("Log not saved {}",e)))?;
     }
-
-    let _ = sync_log
+    sync_log
         .update_last_synced_block_number(to_block_number, &mut *tx)
-        .await
-        .inspect_err(|error| eprintln!("Error updating last_synced_block_number {error}"));
-
-    match tx.commit().await {
-        Ok(_) => {
-            println!("Saved logs for {address}, blocks: {from_block_number} to {to_block_number}",)
-        }
-        Err(err) => eprintln!("{err}"),
-    }
-
+        .await.map_err(|e| AppError::EVMLog(format!("Error updating last_synced_block_number {}",e)))?;
+      
+    tx.commit().await?;
+    println!(
+            "Saved logs for {address}, blocks: {from_block_number} to {to_block_number}"
+    );
     Ok(())
 }

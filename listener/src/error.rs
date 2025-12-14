@@ -16,5 +16,8 @@ pub enum AppError {
     RPCError(String),
 
     #[error("Invalid address: ${0}")]
-    InvalidAddress(String)
+    InvalidAddress(String),
+
+    #[error("Not saved Error {0}")]
+    EVMLog(String),    
 }
