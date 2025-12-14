@@ -23,7 +23,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addresses = contract_addresses.split(",");
 
     let evm_chain = EvmChains::fetch_by_id(chain_id, &db_pool).await?;
-
     let mut service_futures = JoinSet::new();
 
     for address in addresses {

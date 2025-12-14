@@ -1,10 +1,5 @@
 use std::{
-    env,
-    error::Error,
-    future::Future,
-    pin::Pin,
-    str::FromStr,
-    task::{Context, Poll},
+    env, error::Error, fmt::format, future::Future, pin::Pin, str::FromStr, task::{Context, Poll}
 };
 
 use alloy::{
@@ -27,7 +22,7 @@ pub struct ListenerService {
 
 impl Service<()> for ListenerService {
     type Response = ();
-    type Error = Box<dyn Error>;
+    type Error = AppError;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
     fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
@@ -47,13 +42,13 @@ pub async fn fetch_and_save_logs(
     chain_id: u64,
     db_pool: Pool<Postgres>,
     address: String,
-) -> Result<(), Box<dyn Error>> {
-    let rpc_url = env::var("RPC_URL").map_err(|_| AppError::MissingEnvVar("RPC_URL".into()))?;
+) -> Result<(), AppError> {
+    let rpc_url: String = env::var("RPC_URL").map_err(|_| AppError::MissingEnvVar("RPC_URL".into()))?;
 
-    let provider = ProviderBuilder::new().on_builtin(&rpc_url).await?;
+    let provider = ProviderBuilder::new().on_builtin(&rpc_url).await.map_err(|e| AppError::RPCError(format!("Provider Error Happened {}",e)))?;
     let sync_log = EvmSyncLogs::find_or_create_by_address(&address, chain_id, &db_pool).await?;
 
-    let latest_block = provider.get_block_number().await?;
+    let latest_block = provider.get_block_number().await.map_err(|e| AppError::RPCError(format!("Failed to get block number {}",e)))?;
     if latest_block == sync_log.last_synced_block_number as u64 {
         println!("Fully indexed address: {address}");
         return Ok(());
@@ -63,18 +58,18 @@ pub async fn fetch_and_save_logs(
         0 => 0, // FIXME: may start from the first tx block
         block_number => block_number + 1_u64,
     };
-
+    let max_range:u64 =10;
     let to_block_number = match sync_log.last_synced_block_number as u64 {
         0 => latest_block,
-        block_number => std::cmp::min(block_number + 10_000_u64, latest_block),
+        block_number => std::cmp::min(block_number + max_range, latest_block),
     };
 
     let filter = Filter::new()
-        .address(Address::from_str(&address)?)
+        .address(Address::from_str(&address).map_err(|e| AppError::InvalidAddress(format!("Invalid address {}",e)))?)
         .from_block(BlockNumberOrTag::Number(from_block_number))
         .to_block(BlockNumberOrTag::Number(to_block_number));
 
-    let logs = provider.get_logs(&filter).await?;
+    let logs = provider.get_logs(&filter).await.map_err(|e| AppError::RPCError(format!("Error in getting logs {}",e)))?;
 
     let mut tx = db_pool.begin().await?;
     for log in logs {
