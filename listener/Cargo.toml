@@ -11,3 +11,6 @@ indexer-db = { path = '../libs/indexer-db', version = '0.0.10' }
 thiserror = { workspace = true }
 tower = { version = '0.5.1', features = ['limit', 'util'] }
 sqlx = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { version = '0.12.12', features = ['json'] }

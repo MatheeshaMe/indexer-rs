@@ -2,6 +2,7 @@ use std::{
     env,future::Future, pin::Pin, str::FromStr, task::{Context, Poll}
 };
 
+
 use alloy::{
     eips::BlockNumberOrTag,
     primitives::Address,
@@ -19,6 +20,38 @@ pub struct ListenerService {
     pub address: String,
     pub db_pool: Pool<Postgres>,
 }
+
+pub async fn find_deployment_block(
+    provider: &impl Provider,
+    address: Address,
+) -> Result<u64, AppError> {
+    let latest = provider
+        .get_block_number()
+        .await
+        .map_err(|e| AppError::RPCError(format!("get_block_number failed: {e}")))?;
+
+    let mut low = 0u64;
+    let mut high = latest;
+
+    while low < high {
+        let mid = (low + high) / 2;
+
+        let code = provider
+            .get_code_at(address)
+            .block_id(mid.into())
+            .await
+            .map_err(|e| AppError::RPCError(format!("get_code_at failed: {e}")))?;
+
+        if code.is_empty() {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+
+    Ok(low)
+}
+
 
 impl Service<()> for ListenerService {
     type Response = ();
@@ -53,16 +86,19 @@ pub async fn fetch_and_save_logs(
         println!("Fully indexed address: {address}");
         return Ok(());
     }
-
-    let from_block_number = match sync_log.last_synced_block_number as u64 {
-        0 => 0, // FIXME: may start from the first tx block
-        block_number => block_number + 1_u64,
+    let from_block_number = if sync_log.last_synced_block_number == 0 {
+        let address = Address::from_str(&address)
+        .map_err(|e| AppError::InvalidAddress(format!("Invalid Address {e}")))?;
+        let deployment_block = find_deployment_block(&provider, address).await?;
+        deployment_block
+    } else {
+        sync_log.last_synced_block_number as u64 + 1
     };
-    let max_range =10;
-    let to_block_number = match sync_log.last_synced_block_number as u64 {
-        0 => latest_block,
-        block_number => std::cmp::min(block_number + max_range, latest_block),
-    };
+    
+    let to_block_number = std::cmp::min(
+        from_block_number + 9,
+        latest_block,
+    );
 
     let filter = Filter::new()
         .address(Address::from_str(&address).map_err(|e| AppError::InvalidAddress(format!("Invalid Address {}",e)))?)
@@ -70,19 +106,46 @@ pub async fn fetch_and_save_logs(
         .to_block(BlockNumberOrTag::Number(to_block_number));
 
     let logs = provider.get_logs(&filter).await.map_err(|e| AppError::RPCError(format!("Error in getting logs {}",e)))?;
-
-    let mut tx = db_pool.begin().await?;
-    for log in logs {
-       EvmLogs::create(log, &mut *tx)
-            .await.map_err(|e| AppError::EVMLog(format!("Log not saved {}",e)))?;
+    println!("Fetched {} logs from RPC for blocks {} to {}", logs.len(), from_block_number, to_block_number);
+    if logs.is_empty() {
+        println!("No logs found in this block range - skipping save");
+        // Still update sync log even if no logs
+        let mut tx = db_pool.begin().await?;
+        sync_log
+            .update_last_synced_block_number(to_block_number, &mut *tx)
+            .await.map_err(|e| AppError::EVMLog(format!("Error updating last_synced_block_number {}",e)))?;
+        tx.commit().await?;
+        return Ok(());
     }
+    let mut tx = db_pool.begin().await?;
+    let mut saved_count = 0;
+    let mut error_count = 0;
+    for log in logs.clone() {
+        match EvmLogs::create(log, &mut *tx).await {
+            Ok(_) => {
+                saved_count += 1;
+            }
+            Err(e) => {
+                error_count += 1;
+                eprintln!("Failed to save log: {:?}", e);
+                // Continue processing other logs
+            }
+        }
+    }
+    println!("Saved {}/{} logs successfully ({} errors)", saved_count, logs.len(), error_count);
+
     sync_log
         .update_last_synced_block_number(to_block_number, &mut *tx)
         .await.map_err(|e| AppError::EVMLog(format!("Error updating last_synced_block_number {}",e)))?;
       
-    tx.commit().await?;
-    println!(
-            "Saved logs for {address}, blocks: {from_block_number} to {to_block_number}"
-    );
+        match tx.commit().await {
+            Ok(_) => {
+                println!("Committed transaction: Saved {} logs for {address}, blocks: {from_block_number} to {to_block_number}", saved_count);
+            }
+            Err(e) => {
+                eprintln!("Transaction commit failed: {:?}", e);
+                return Err(AppError::Database(e));
+            }
+        }
     Ok(())
 }
