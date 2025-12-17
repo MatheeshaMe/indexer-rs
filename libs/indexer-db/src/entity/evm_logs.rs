@@ -114,7 +114,7 @@ impl EvmLogs {
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
             RETURNING *
         "#;
-
+        println!("logs for {:?} {:?} {:?} {:?}",address,topics,log_data,log_index);
         sqlx::query_as::<_, EvmLogs>(query)
             .bind(block_hash)
             .bind(block_number)

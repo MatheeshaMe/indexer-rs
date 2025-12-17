@@ -2,6 +2,13 @@
 
 `indexer-rs` is a robust, production-ready service built in Rust that monitors and indexes events from EVM-compatible blockchain networks. The service is designed for high reliability and performance, with features tailored for blockchain data indexing.
 
+fix
+```rs
+set -a
+source .env
+set +a
+```
+
 ### Key Features
 
 - **Multi-Chain Support**

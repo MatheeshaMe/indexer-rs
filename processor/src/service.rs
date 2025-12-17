@@ -7,7 +7,7 @@ use crate::{contracts::ContractRegistry, defaults, ContractHandler};
 
 pub async fn process_logs(db_pool: &Pool<Postgres>) -> Result<(), Box<dyn Error>> {
     let contract_registry = ContractRegistry::new()?;
-    let batch_size = env::var("BATCH_SIZE")
+    let batch_size: i32 = env::var("BATCH_SIZE")
         .or::<String>(Ok(defaults::BATCH_SIZE.into()))?
         .parse::<i32>()?;
 

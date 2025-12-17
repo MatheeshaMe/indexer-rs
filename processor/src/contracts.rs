@@ -1,13 +1,11 @@
 use std::{collections::HashMap, env};
 
 use contract_handler::ContractHandler;
-use uniswap::UniswapV3Factory;
 
 use crate::{error::AppError, utils};
 
 pub mod contract_handler;
-pub mod uniswap;
-
+pub mod usdt;
 pub struct ContractRegistry {
     registry: HashMap<String, String>,
 }
@@ -40,7 +38,7 @@ impl ContractRegistry {
 
         if let Some(contract_name) = contract {
             match contract_name.as_str() {
-                UniswapV3Factory::NAME => UniswapV3Factory::new(&log_address),
+                usdt::USDTErc20::NAME => usdt::USDTErc20::new(&log_address),
                 unsupported => Err(AppError::UnsupportedContract(unsupported.into())),
             }
         } else {
@@ -48,3 +46,4 @@ impl ContractRegistry {
         }
     }
 }
+
