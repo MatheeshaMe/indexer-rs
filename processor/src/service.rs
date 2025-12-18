@@ -11,6 +11,13 @@ pub async fn process_logs(db_pool: &Pool<Postgres>) -> Result<(), Box<dyn Error>
         .or::<String>(Ok(defaults::BATCH_SIZE.into()))?
         .parse::<i32>()?;
 
+    // Get chain_id from environment
+    let chain_id_str = env::var("CHAIN_ID")
+        .map_err(|_| "Missing CHAIN_ID environment variable")?;
+    let chain_id: i64 = chain_id_str
+        .parse()
+        .map_err(|_| format!("Invalid CHAIN_ID: {}", chain_id_str))?;
+
     let unprocessed_logs = EvmLogs::find_all(batch_size, db_pool).await?;
 
     let mut futures = JoinSet::new();
@@ -21,9 +28,10 @@ pub async fn process_logs(db_pool: &Pool<Postgres>) -> Result<(), Box<dyn Error>
             Ok(processor) => {
                 let service_db_pool = db_pool.clone();
                 let log_id = log.id;
+                let chain_id = chain_id;
 
                 futures.spawn(async move {
-                    match processor.process(log).await {
+                    match processor.process(log, &service_db_pool, chain_id).await {
                         Ok(_) => {
                             if let Err(error) = EvmLogs::delete(log_id, &service_db_pool).await {
                                 eprintln!("{}", error)

@@ -2,6 +2,7 @@ use std::env;
 
 use alloy::{json_abi::JsonAbi, primitives::keccak256, rpc::types::Log};
 use indexer_db::entity::evm_logs::EvmLogs;
+use sqlx::{Postgres, Pool};
 
 use crate::{error::AppError, utils};
 
@@ -45,14 +46,16 @@ pub trait ContractHandler {
     fn process(
         &self,
         unprocessed_log: EvmLogs,
+        connection: &Pool<Postgres>,
+        chain_id: i64,
     ) -> impl std::future::Future<Output = Result<(), AppError>> + Send
     where
         Self: Sync,
     {
-        async {
+        async move {
             let event_name = self.event_signature_to_name(unprocessed_log.event_signature)?;
             let log: Log = unprocessed_log.try_into()?;
-            self.handle_event(&event_name, &log).await?;
+            self.handle_event(&event_name, &log, connection, chain_id).await?;
             Ok(())
         }
     }
@@ -65,6 +68,8 @@ pub trait ContractHandler {
         &self,
         event: &str,
         log: &Log,
+        connection: &Pool<Postgres>,
+        chain_id: i64,
     ) -> impl std::future::Future<Output = Result<(), AppError>> + Send
     where
         Self: Sync;

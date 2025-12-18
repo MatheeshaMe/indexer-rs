@@ -1,6 +1,7 @@
 use std::fmt::Debug;
 
 use indexer_db::entity::evm_logs::EvmLogsError;
+use sqlx::Error as SqlxError;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -34,5 +35,18 @@ pub enum AppError {
         #[from]
         #[source]
         source: EvmLogsError,
+    },
+
+    #[error("Database error: `{0}`")]
+    Database(String),
+
+    #[error("Invalid chain ID: `{0}`")]
+    InvalidChainID(String),
+
+    #[error("SQLx error occurred")]
+    Sqlx {
+        #[from]
+        #[source]
+        source: SqlxError,
     },
 }
