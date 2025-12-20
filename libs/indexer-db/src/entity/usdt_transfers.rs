@@ -1,6 +1,6 @@
 use sqlx::{Executor, Postgres, types::{BigDecimal, chrono}};
 
-#[derive(sqlx::FromRow,Debug)]
+#[derive(sqlx::FromRow,Debug,Clone)]
 pub struct UsdtTransfers{
     pub id: i64,
     pub tx_hash: [u8; 32],
@@ -23,6 +23,7 @@ impl UsdtTransfers {
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
             RETURNING *
         "#;
+        println!("query {}",query);
         sqlx::query_as::<_, UsdtTransfers>(query)
             .bind(transfer.tx_hash)
             .bind(transfer.block_number)

@@ -122,19 +122,33 @@ impl USDTErc20 {
             chain_id,
             created_at: chrono::Utc::now().naive_utc(), // Will be set by database, but set here for completeness
         };
-
+         println!("transfer_processing: {:?}",transfer);
         // Insert into database
         // Pool<Postgres> implements Executor, so we can use it directly
-        UsdtTransfers::create(transfer, connection)
-            .await
-            .map_err(|e| AppError::Sqlx { source: e })?;
+        match UsdtTransfers::create(transfer.clone(), connection).await {
+            Ok(result) => {
+                println!(
+                    "USDT Transfer stored: from {from:?} to {to:?} value {}",
+                    value_u256
+                );
+                return Ok(())
+            }
+            Err(e) => {
+                // Print the actual SQLx error details
+                eprintln!("Failed to insert USDT transfer:");
+                eprintln!("  Error: {}", e);
+                eprintln!("  Error type: {:?}", e);
+                eprintln!("  Transfer: tx_hash={:?}, from={:?}, to={:?}, value={}, chain_id={}", 
+                    transfer.tx_hash, transfer.from_address, transfer.to_address, transfer.value, transfer.chain_id);
+                 return Err(AppError::Sqlx { source: e })
+            }
+        };
+        // println!(
+        //     "USDT Transfer stored: from {from:?} to {to:?} value {}",
+        //     value_u256
+        // );
 
-        println!(
-            "USDT Transfer stored: from {from:?} to {to:?} value {}",
-            value_u256
-        );
-
-        Ok(())
+        // Ok(())
     }
 
     async fn approval(

@@ -3,7 +3,7 @@ use sqlx::{Pool, Postgres};
 use std::{env, error::Error};
 use tokio::task::JoinSet;
 
-use crate::{contracts::ContractRegistry, defaults, ContractHandler};
+use crate::{ContractHandler, contracts::ContractRegistry, defaults, error::AppError};
 
 pub async fn process_logs(db_pool: &Pool<Postgres>) -> Result<(), Box<dyn Error>> {
     let contract_registry = ContractRegistry::new()?;
@@ -41,7 +41,13 @@ pub async fn process_logs(db_pool: &Pool<Postgres>) -> Result<(), Box<dyn Error>
                     }
                 });
             }
-            Err(error) => eprintln!("{}", error),
+            Err(error) => {
+                eprintln!("Error processing log {}: {:?}", log.id, error);
+                // Also print the source error if it's a SQLx error
+                if let AppError::Sqlx { source } = &error {
+                    eprintln!("  SQLx error details: {}", source);
+                }
+            },
         }
     }
 
