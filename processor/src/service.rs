@@ -18,7 +18,7 @@ pub async fn process_logs(db_pool: &Pool<Postgres>) -> Result<(), Box<dyn Error>
         .parse()
         .map_err(|_| format!("Invalid CHAIN_ID: {}", chain_id_str))?;
 
-    let unprocessed_logs = EvmLogs::find_all(batch_size, db_pool).await?;
+    let unprocessed_logs = EvmLogs::find_unprocessed(batch_size, db_pool).await?;
 
     let mut futures = JoinSet::new();
     for log in unprocessed_logs {
@@ -33,8 +33,8 @@ pub async fn process_logs(db_pool: &Pool<Postgres>) -> Result<(), Box<dyn Error>
                 futures.spawn(async move {
                     match processor.process(log, &service_db_pool, chain_id).await {
                         Ok(_) => {
-                            if let Err(error) = EvmLogs::delete(log_id, &service_db_pool).await {
-                                eprintln!("Failed to delete processed log {}: {}", log_id, error)
+                            if let Err(error) = EvmLogs::mark_as_final(log_id, &service_db_pool).await {
+                                eprintln!("Failed to mark log {} as final: {}", log_id, error)
                             }
                         }
                         Err(error) => eprintln!("Failed to process log {}: {}", log_id, error),

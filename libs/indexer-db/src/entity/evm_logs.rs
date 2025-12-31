@@ -132,6 +132,20 @@ impl EvmLogs {
             .await
     }
 
+    /// Find all unprocessed logs (removed = false AND is_final = false)
+    pub async fn find_unprocessed<'c, E>(page_size: i32, connection: E) -> Result<Vec<EvmLogs>, sqlx::Error>
+    where
+        E: Executor<'c, Database = Postgres>,
+    {
+        sqlx::query_as::<_, EvmLogs>(
+            "SELECT * FROM evm_logs WHERE removed = false AND is_final = false ORDER BY block_number ASC, log_index ASC LIMIT $1"
+        )
+            .bind(page_size)
+            .fetch_all(connection)
+            .await
+    }
+
+    /// Legacy method for backward compatibility (finds all logs, not recommended)
     pub async fn find_all<'c, E>(page_size: i32, connection: E) -> Result<Vec<EvmLogs>, sqlx::Error>
     where
         E: Executor<'c, Database = Postgres>,
@@ -142,6 +156,46 @@ impl EvmLogs {
             .await
     }
 
+    /// Mark a log as final (processed)
+    pub async fn mark_as_final<'c, E>(id: i32, connection: E) -> Result<(), sqlx::Error>
+    where
+        E: Executor<'c, Database = Postgres>,
+    {
+        sqlx::query("UPDATE evm_logs SET is_final = true WHERE id = $1")
+            .bind(id)
+            .execute(connection)
+            .await?;
+
+        Ok(())
+    }
+
+    /// Mark logs as removed for a block range (used during reorgs)
+    pub async fn mark_removed_by_block_range<'c, E>(
+        from_block: u64,
+        to_block: u64,
+        address: &[u8; 20],
+        connection: E,
+    ) -> Result<u64, sqlx::Error>
+    where
+        E: Executor<'c, Database = Postgres>,
+    {
+        let from_block_bd = <u64 as Into<BigDecimal>>::into(from_block);
+        let to_block_bd = <u64 as Into<BigDecimal>>::into(to_block);
+
+        let result = sqlx::query(
+            "UPDATE evm_logs SET removed = true WHERE address = $1 AND block_number >= $2 AND block_number <= $3 AND removed = false"
+        )
+            .bind(&address[..])
+            .bind(from_block_bd)
+            .bind(to_block_bd)
+            .execute(connection)
+            .await?;
+
+        Ok(result.rows_affected() as u64)
+    }
+
+    /// Legacy delete method (deprecated, use mark_as_final instead)
+    #[deprecated(note = "Use mark_as_final instead to preserve log history")]
     pub async fn delete<'c, E>(id: i32, connection: E) -> Result<(), sqlx::Error>
     where
         E: Executor<'c, Database = Postgres>,
@@ -152,6 +206,22 @@ impl EvmLogs {
             .await?;
 
         Ok(())
+    }
+
+    /// Count unprocessed logs (removed = false AND is_final = false)
+    pub async fn count_unprocessed<'c, E>(connection: E) -> Result<Option<i64>, sqlx::Error>
+    where
+        E: Executor<'c, Database = Postgres>,
+    {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM evm_logs WHERE removed = false AND is_final = false")
+            .fetch_one(connection)
+            .await?;
+
+        if count == 0 {
+            return Ok(None);
+        }
+
+        Ok(Some(count))
     }
 
     pub async fn count<'c, E>(connection: E) -> Result<Option<i64>, sqlx::Error>

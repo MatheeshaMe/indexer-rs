@@ -22,7 +22,7 @@ pub struct ListenerService {
     pub chain_id: u64,
     pub address: String,
     pub db_pool: Pool<Postgres>,
-    #[allow(dead_code)] // Used for future mode-specific logic
+    #[allow(dead_code)] // Reserved for future use
     pub mode: ListenerMode,
 }
 
@@ -56,7 +56,7 @@ pub async fn get_safe_head(provider: &impl Provider) -> Result<u64, AppError> {
 /// If more than 100 blocks behind, starts from latest - 100 for faster backfill
 pub async fn get_backfill_start_block(
     provider: &impl Provider,
-    address: Address,
+    _address: Address, // Used for deployment block detection if needed
     sync_log: &EvmSyncLogs,
 ) -> Result<u64, AppError> {
     // Check if BACKFILL_FROM_BLOCK is set
@@ -104,35 +104,7 @@ pub async fn get_backfill_start_block(
     Ok(start_block)
 }
 
-/// Check for reorg by comparing block hash
-pub async fn check_reorg(
-    provider: &impl Provider,
-    block_number: u64,
-    expected_hash: Option<[u8; 32]>,
-) -> Result<bool, AppError> {
-    if expected_hash.is_none() {
-        return Ok(false); // No previous hash to compare
-    }
-
-    let block = provider
-        .get_block_by_number(BlockNumberOrTag::Number(block_number), BlockTransactionsKind::Full)
-        .await
-        .map_err(|e| AppError::RPCError(format!("get_block_by_number failed: {e}")))?;
-
-    if let Some(block) = block {
-        let block_hash = block.header.hash;
-        let actual_hash: [u8; 32] = block_hash.into();
-        let expected = expected_hash.unwrap();
-
-        if actual_hash != expected {
-            return Ok(true); // Reorg detected
-        }
-    }
-
-    Ok(false)
-}
-
-/// Fetch and save logs (used by both backfill and WS)
+/// Fetch and save logs for backfill (no reorg detection needed, blocks are final)
 pub async fn fetch_and_save_logs(
     chain_id: u64,
     db_pool: Pool<Postgres>,
@@ -172,35 +144,19 @@ pub async fn fetch_and_save_logs(
         return Ok(to_block);
     }
 
-    // Get block hash for reorg detection (optional - column may not exist yet)
+    // Get block hash for tracking (not for reorg detection in backfill - blocks are final)
     let block_hash = match provider
         .get_block_by_number(BlockNumberOrTag::Number(to_block), BlockTransactionsKind::Full)
         .await
     {
         Ok(block) => block.map(|b| -> [u8; 32] { b.header.hash.into() }),
         Err(e) => {
-            eprintln!("Warning: Could not fetch block hash for reorg detection: {e}");
-            None // Continue without block hash if RPC fails
+            eprintln!("Warning: Could not fetch block hash: {e}");
+            None
         }
     };
 
-    // Check for reorg at the block we're about to save
     let sync_log = EvmSyncLogs::find_by_address(&address, &db_pool).await?;
-    if let Some(ref sync) = sync_log {
-        if sync.last_synced_block_number == to_block as i64 {
-            // We've already synced this block, check for reorg
-            if let Some(ref expected_hash_vec) = sync.last_synced_block_hash {
-                if expected_hash_vec.len() == 32 {
-                    let mut expected_hash = [0u8; 32];
-                    expected_hash.copy_from_slice(expected_hash_vec);
-                    let reorg = check_reorg(&provider, to_block, Some(expected_hash)).await?;
-                    if reorg {
-                        return Err(AppError::ReorgDetected(to_block));
-                    }
-                }
-            }
-        }
-    }
 
     let logs_count = logs.len();
     let mut tx = db_pool.begin().await?;
@@ -265,6 +221,133 @@ pub async fn fetch_and_save_logs(
             println!(
                 "Committed transaction: Saved {} logs for {address}, blocks: {from_block} to {to_block}",
                 saved_count
+            );
+            Ok(to_block)
+        }
+        Err(e) => {
+            eprintln!("Transaction commit failed: {:?}", e);
+            Err(AppError::Database(e))
+        }
+    }
+}
+
+/// Fetch and save logs for WebSocket mode (handles `removed` field for reorg detection)
+pub async fn fetch_and_save_logs_ws(
+    chain_id: u64,
+    db_pool: Pool<Postgres>,
+    address: String,
+    from_block: u64,
+    to_block: u64,
+    provider: &impl Provider,
+) -> Result<u64, AppError> {
+    let contract_address = Address::from_str(&address)
+        .map_err(|e| AppError::InvalidAddress(format!("Invalid Address {e}")))?;
+
+    let filter = Filter::new()
+        .address(contract_address)
+        .from_block(BlockNumberOrTag::Number(from_block))
+        .to_block(BlockNumberOrTag::Number(to_block));
+
+    let logs = provider
+        .get_logs(&filter)
+        .await
+        .map_err(|e| AppError::RPCError(format!("Error in getting logs {}", e)))?;
+
+    println!(
+        "Fetched {} logs from WebSocket for blocks {} to {}",
+        logs.len(),
+        from_block,
+        to_block
+    );
+
+    if logs.is_empty() {
+        // Still update sync log even if no logs
+        let sync_log = EvmSyncLogs::find_by_address(&address, &db_pool).await?;
+        if let Some(sync) = sync_log {
+            sync.update_last_synced_block_number(to_block, &db_pool).await
+                .map_err(|e| AppError::Database(e))?;
+        } else {
+            EvmSyncLogs::create(&address, chain_id, Some(to_block as i64), &db_pool).await?;
+        }
+        return Ok(to_block);
+    }
+
+    let mut tx = db_pool.begin().await?;
+    let mut saved_count = 0;
+    let mut removed_count = 0;
+    let mut error_count = 0;
+
+    // Separate logs by removed status
+    let mut logs_to_save = Vec::new();
+    let mut blocks_with_removed_logs = std::collections::HashSet::new();
+
+    for log in logs {
+        if log.removed {
+            // Log was removed due to reorg - mark existing logs for this block as removed
+            if let Some(block_num) = log.block_number {
+                blocks_with_removed_logs.insert(block_num);
+            }
+            removed_count += 1;
+        } else {
+            // Normal log - save it
+            logs_to_save.push(log);
+        }
+    }
+
+    // Mark logs as removed for blocks that had removed logs
+    if !blocks_with_removed_logs.is_empty() {
+        let address_array: [u8; 20] = (*contract_address).into();
+
+        for block_num in &blocks_with_removed_logs {
+            let marked = EvmLogs::mark_removed_by_block_range(
+                *block_num,
+                *block_num,
+                &address_array,
+                &mut *tx,
+            ).await
+            .map_err(|e| AppError::Database(e))?;
+            
+            if marked > 0 {
+                println!("Marked {} logs as removed for block {} (reorg detected)", marked, block_num);
+            }
+        }
+    }
+
+    // Save new logs (removed = false)
+    for log in logs_to_save {
+        match EvmLogs::create(log, &mut *tx).await {
+            Ok(_) => {
+                saved_count += 1;
+            }
+            Err(e) => {
+                error_count += 1;
+                eprintln!("Failed to save log: {:?}", e);
+            }
+        }
+    }
+
+    println!(
+        "Saved {}/{} new logs, marked {} logs as removed ({} errors)",
+        saved_count,
+        saved_count + removed_count,
+        removed_count,
+        error_count
+    );
+
+    // Update sync log
+    let sync_log = EvmSyncLogs::find_by_address(&address, &db_pool).await?;
+    if let Some(sync) = sync_log {
+        sync.update_last_synced_block_number(to_block, &mut *tx).await
+            .map_err(|e| AppError::Database(e))?;
+    } else {
+        EvmSyncLogs::create(&address, chain_id, Some(to_block as i64), &mut *tx).await?;
+    }
+
+    match tx.commit().await {
+        Ok(_) => {
+            println!(
+                "Committed transaction: Saved {} logs, marked {} removed for {address}, blocks: {from_block} to {to_block}",
+                saved_count, removed_count
             );
             Ok(to_block)
         }
@@ -388,19 +471,6 @@ pub async fn run_backfill_once(
                     return Err(AppError::BackfillComplete);
                 }
             }
-            Err(AppError::ReorgDetected(block)) => {
-                eprintln!("Reorg detected at block {block} for {address}, rolling back...");
-                // Rollback: set last_synced_block_number to block - 1
-                let sync_log = EvmSyncLogs::find_by_address(&address, &db_pool).await?;
-                if let Some(sync) = sync_log {
-                    let rollback_block = block.saturating_sub(1);
-                    sync.update_last_synced_block_number(rollback_block, &db_pool)
-                        .await
-                        .map_err(|e| AppError::Database(e))?;
-                    current_block = rollback_block + 1;
-                    println!("Rolled back to block {rollback_block}, resuming from {}", current_block);
-                }
-            }
             Err(e) => {
                 eprintln!("Error during backfill for {address}: {:?}", e);
                 return Err(e);
@@ -409,74 +479,143 @@ pub async fn run_backfill_once(
     }
 }
 
-/// Run WebSocket live listener (never returns)
+// / Run WebSocket live listener (never returns)
 pub async fn run_ws_forever(
     chain_id: u64,
     db_pool: Pool<Postgres>,
     address: String,
 ) -> std::result::Result<std::convert::Infallible, AppError> {
-    let ws_url = env::var("WS_URL")
-        .or_else(|_| env::var("RPC_URL").map(|url| url.replace("https://", "wss://").replace("http://", "ws://")))
-        .map_err(|_| AppError::MissingEnvVar("WS_URL or RPC_URL".into()))?;
+    // Get WebSocket URL
+    let ws_rpc_url = env::var("WS_RPC")
+        .map_err(|_| AppError::MissingEnvVar("WS_RPC is missing in env".into()))?;
 
-    println!("Starting WebSocket listener for {address} on {ws_url}");
+    println!("Starting WebSocket listener for {address} on {ws_rpc_url}");
 
-    // For now, fallback to HTTP polling if WS is not available
-    // TODO: Implement proper WebSocket subscription with alloy
-    // This is a placeholder that uses HTTP polling as a fallback
-    let rpc_url: String =
-        env::var("RPC_URL").map_err(|_| AppError::MissingEnvVar("RPC_URL".into()))?;
+    let contract_address = Address::from_str(&address)
+        .map_err(|e| AppError::InvalidAddress(format!("Invalid Address {e}")))?;
 
-    let provider = ProviderBuilder::new()
-        .on_builtin(&rpc_url)
-        .await
-        .map_err(|e| AppError::RPCError(format!("Provider Error Happened {}", e)))?;
-
+    // Get sync state
     let sync_log = EvmSyncLogs::find_or_create_by_address(&address, chain_id, &db_pool).await?;
-    let from_block = sync_log.last_synced_block_number as u64 + 1;
-    let mut current_block = from_block;
+    let mut current_block = sync_log.last_synced_block_number as u64 + 1;
 
-    // Live polling loop (infinite)
+    // WebSocket connection loop with reconnection
     loop {
-        let latest_block = provider
-            .get_block_number()
-            .await
-            .map_err(|e| AppError::RPCError(format!("Failed to get block number {}", e)))?;
-
-        if current_block > latest_block {
-            // Wait for new blocks
-            sleep(Duration::from_secs(2)).await;
-            continue;
-        }
-
-        let to_block = std::cmp::min(current_block + 9, latest_block);
-
-        match fetch_and_save_logs(chain_id, db_pool.clone(), address.clone(), current_block, to_block)
-            .await
+        match try_ws_connection(
+            &ws_rpc_url,
+            chain_id,
+            db_pool.clone(),
+            address.clone(),
+            contract_address,
+            &mut current_block,
+        )
+        .await
         {
-            Ok(last_synced) => {
-                current_block = last_synced + 1;
-                println!("Live sync: {address} synced to block {last_synced}");
-            }
-            Err(AppError::ReorgDetected(block)) => {
-                eprintln!("Reorg detected at block {block} for {address}, rolling back...");
-                let sync_log = EvmSyncLogs::find_by_address(&address, &db_pool).await?;
-                if let Some(sync) = sync_log {
-                    let rollback_block = block.saturating_sub(1);
-                    sync.update_last_synced_block_number(rollback_block, &db_pool)
-                        .await
-                        .map_err(|e| AppError::Database(e))?;
-                    current_block = rollback_block + 1;
-                }
+            Ok(_) => {
+                // Connection ended normally (shouldn't happen)
+                eprintln!("WebSocket connection closed unexpectedly for {address}, reconnecting...");
             }
             Err(e) => {
-                eprintln!("Error during live sync for {address}: {:?}, retrying...", e);
+                eprintln!("WebSocket error for {address}: {:?}, reconnecting in 5 seconds...", e);
                 sleep(Duration::from_secs(5)).await;
             }
         }
+    }
+}
 
-        // Small delay between polls
-        // sleep(Duration::from_secs(1)).await;
+/// Try to establish WebSocket connection and process blocks
+async fn try_ws_connection(
+    ws_url: &str,
+    chain_id: u64,
+    db_pool: Pool<Postgres>,
+    address: String,
+    _contract_address: Address, // Reserved for future use
+    current_block: &mut u64,
+) -> std::result::Result<std::convert::Infallible, AppError> {
+    //  uses WebSocket transport, otherwise falls back to HTTP
+    let provider = ProviderBuilder::new()
+        .on_builtin(ws_url)
+        .await
+        .map_err(|e| AppError::WebSocketError(format!("Failed to connect to WebSocket: {e}")))?;
+
+    println!("WebSocket connected for {address}, starting block monitoring...");
+
+    // First, catch up to latest block if we're behind
+    let latest_block = provider
+        .get_block_number()
+        .await
+        .map_err(|e| AppError::RPCError(format!("Failed to get block number: {e}")))?;
+
+    if *current_block <= latest_block {
+        let catchup_blocks = latest_block.saturating_sub(*current_block) + 1;
+        println!("Catching up: {} blocks behind, syncing from {} to {}", 
+                 catchup_blocks, *current_block, latest_block);
+        
+        // Catch up in batches using WebSocket (with removed field detection)
+        while *current_block <= latest_block {
+            let to_block = std::cmp::min(*current_block + 9, latest_block);
+            
+            match fetch_and_save_logs_ws(chain_id, db_pool.clone(), address.clone(), *current_block, to_block, &provider)
+                .await
+            {
+                Ok(last_synced) => {
+                    *current_block = last_synced + 1;
+                    if last_synced % 10 == 0 || last_synced == latest_block {
+                        println!("Caught up to block {} ({} remaining)", 
+                                 last_synced, latest_block.saturating_sub(last_synced));
+                    }
+                }
+                Err(e) => {
+                    return Err(e);
+                }
+            }
+        }
+        
+        println!("Catchup complete, now listening for new blocks via WebSocket...");
+    }
+
+    // Use WebSocket provider for faster polling (lower latency than HTTP)
+    // WebSocket maintains persistent connection, reducing overhead
+    let mut last_seen_block = *current_block - 1;
+    let mut consecutive_no_new_blocks = 0;
+    
+    loop {
+        // Poll for new blocks using WebSocket (faster than HTTP)
+        let latest_block = provider
+            .get_block_number()
+            .await
+            .map_err(|e| AppError::RPCError(format!("Failed to get block number: {e}")))?;
+
+        if latest_block > last_seen_block {
+            // New block(s) available
+            consecutive_no_new_blocks = 0;
+            let from_block = *current_block;
+            let to_block = latest_block;
+
+            match fetch_and_save_logs_ws(chain_id, db_pool.clone(), address.clone(), from_block, to_block, &provider)
+                .await
+            {
+                Ok(last_synced) => {
+                    *current_block = last_synced + 1;
+                    last_seen_block = last_synced;
+                    println!("New block {} synced for {address} (via WebSocket)", last_synced);
+                }
+                Err(e) => {
+                    return Err(e);
+                }
+            }
+        } else {
+            // No new blocks yet
+            consecutive_no_new_blocks += 1;
+            // Use shorter polling interval with WebSocket (faster than HTTP)
+            // WebSocket connection stays alive, so this is efficient
+            sleep(Duration::from_millis(500)).await;
+            
+            // Log every 10 seconds if no new blocks
+            if consecutive_no_new_blocks % 20 == 0 {
+                println!("⏳ Waiting for new blocks... (current: {}, latest: {})", 
+                         last_seen_block, latest_block);
+            }
+        }
     }
 }
 

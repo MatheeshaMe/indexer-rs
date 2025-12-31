@@ -29,6 +29,7 @@ pub enum AppError {
     BackfillComplete,
 
     #[error("Reorg detected at block {0}")]
+    #[allow(dead_code)] // Reserved for future use if needed
     ReorgDetected(u64),
 
     #[error("Block hash mismatch - possible reorg")]
