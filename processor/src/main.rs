@@ -1,6 +1,6 @@
 use contracts::contract_handler::ContractHandler;
 use indexer_db::{entity::evm_logs::EvmLogs, initialize_database};
-use service::process_logs;
+use service::{process_logs, cleanup_removed_logs};
 use std::{env, error::Error};
 use tokio::time::{sleep, Duration};
 
@@ -24,7 +24,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let sleep_duration = Duration::from_secs(poll_interval);
 
     loop {
-        let unprocessed_count = match EvmLogs::count(&db_pool).await {
+        let unprocessed_count = match EvmLogs::count_unprocessed(&db_pool).await {
             Ok(count) => count,
             Err(err) => {
                 eprintln!(
@@ -36,6 +36,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 continue;
             }
         };
+
+        // First, cleanup removed logs (reorgs)
+        if let Err(err) = cleanup_removed_logs(&db_pool).await {
+            eprintln!("Error cleaning up removed logs: {err}");
+        }
 
         match unprocessed_count {
             Some(count) => {

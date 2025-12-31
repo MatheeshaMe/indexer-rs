@@ -6,7 +6,7 @@ use alloy::{
     providers::{Provider, ProviderBuilder},
     rpc::types::{Filter, BlockTransactionsKind},
 };
-use indexer_db::entity::{evm_logs::EvmLogs, evm_sync_logs::EvmSyncLogs};
+use indexer_db::entity::{blocks::Block, evm_logs::EvmLogs, evm_sync_logs::EvmSyncLogs};
 use sqlx::{Pool, Postgres};
 use tokio::time::sleep;
 
@@ -48,6 +48,35 @@ pub async fn get_safe_head(provider: &impl Provider) -> Result<u64, AppError> {
     let safe_head = latest.saturating_sub(finality);
 
     Ok(safe_head)
+}
+
+/// Verify block hash continuity (detect reorgs by checking parent hash)
+/// Returns (current_block_hash, parent_hash) if valid, or error if reorg detected
+pub async fn verify_block_hash_continuity(
+    provider: &impl Provider,
+    block_number: u64,
+    expected_parent_hash: Option<[u8; 32]>,
+) -> Result<([u8; 32], [u8; 32]), AppError> {
+    let block = provider
+        .get_block_by_number(
+            BlockNumberOrTag::Number(block_number),
+            BlockTransactionsKind::Full,
+        )
+        .await
+        .map_err(|e| AppError::RPCError(format!("Failed to get block {}: {e}", block_number)))?
+        .ok_or_else(|| AppError::RPCError(format!("Block {} not found", block_number)))?;
+
+    let current_hash: [u8; 32] = block.header.hash.into();
+    let parent_hash: [u8; 32] = block.header.parent_hash.into();
+
+    // If we have expected parent hash, verify continuity
+    if let Some(expected) = expected_parent_hash {
+        if parent_hash != expected {
+            return Err(AppError::ReorgDetected(block_number));
+        }
+    }
+
+    Ok((current_hash, parent_hash))
 }
 
 
@@ -232,6 +261,7 @@ pub async fn fetch_and_save_logs(
 }
 
 /// Fetch and save logs for WebSocket mode (handles `removed` field for reorg detection)
+/// Includes block hash continuity verification for robust reorg detection
 pub async fn fetch_and_save_logs_ws(
     chain_id: u64,
     db_pool: Pool<Postgres>,
@@ -242,6 +272,66 @@ pub async fn fetch_and_save_logs_ws(
 ) -> Result<u64, AppError> {
     let contract_address = Address::from_str(&address)
         .map_err(|e| AppError::InvalidAddress(format!("Invalid Address {e}")))?;
+
+    // CRITICAL: Verify block hash continuity before processing logs
+    // This catches reorgs that the `removed` field might miss
+    let sync_log = EvmSyncLogs::find_by_address(&address, &db_pool).await?;
+    let expected_parent_hash = sync_log
+        .as_ref()
+        .and_then(|s| s.last_synced_block_hash.as_ref())
+        .and_then(|h| {
+            if h.len() == 32 {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(h);
+                Some(arr)
+            } else {
+                None
+            }
+        });
+
+    // Verify each block in range for hash continuity and track in blocks table
+    let mut verified_hashes = Vec::new();
+    for block_num in from_block..=to_block {
+        let expected = if block_num == from_block {
+            expected_parent_hash
+        } else {
+            // For subsequent blocks, use previous block's hash as expected parent
+            verified_hashes.last().map(|(hash, _)| *hash)
+        };
+
+        match verify_block_hash_continuity(provider, block_num, expected).await {
+            Ok((current_hash, parent_hash)) => {
+                // Store block in blocks table for tracking and analytics
+                if let Err(e) = Block::create_or_update(block_num, current_hash, parent_hash, &db_pool).await {
+                    eprintln!("Warning: Failed to store block {} in blocks table: {}", block_num, e);
+                    // Continue processing even if block storage fails
+                }
+                verified_hashes.push((current_hash, parent_hash));
+            }
+            Err(AppError::ReorgDetected(block)) => {
+                eprintln!("Reorg detected at block {} via hash continuity check", block);
+                // Mark all logs from this block onwards as removed
+                let address_array: [u8; 20] = (*contract_address).into();
+                let mut tx = db_pool.begin().await?;
+                let marked = EvmLogs::mark_removed_by_block_range(
+                    block,
+                    to_block,
+                    &address_array,
+                    &mut *tx,
+                )
+                .await
+                .map_err(|e| AppError::Database(e))?;
+                tx.commit().await?;
+                
+                if marked > 0 {
+                    println!("Marked {} logs as removed due to reorg at block {}", marked, block);
+                }
+                
+                return Err(AppError::ReorgDetected(block));
+            }
+            Err(e) => return Err(e),
+        }
+    }
 
     let filter = Filter::new()
         .address(contract_address)
@@ -254,18 +344,30 @@ pub async fn fetch_and_save_logs_ws(
         .map_err(|e| AppError::RPCError(format!("Error in getting logs {}", e)))?;
 
     println!(
-        "Fetched {} logs from WebSocket for blocks {} to {}",
+        "Fetched {} logs from WebSocket for blocks {} to {} (hash continuity verified)",
         logs.len(),
         from_block,
         to_block
     );
 
     if logs.is_empty() {
-        // Still update sync log even if no logs
+        // Still update sync log even if no logs, but with verified block hash
         let sync_log = EvmSyncLogs::find_by_address(&address, &db_pool).await?;
         if let Some(sync) = sync_log {
             sync.update_last_synced_block_number(to_block, &db_pool).await
                 .map_err(|e| AppError::Database(e))?;
+            
+            // Update block hash
+            if let Some((hash, _)) = verified_hashes.last() {
+                sqlx::query(
+                    "UPDATE evm_sync_logs SET last_synced_block_hash = $1 WHERE address = $2"
+                )
+                .bind(&hash[..])
+                .bind(&sync.address[..])
+                .execute(&db_pool)
+                .await
+                .map_err(|e| AppError::Database(e))?;
+            }
         } else {
             EvmSyncLogs::create(&address, chain_id, Some(to_block as i64), &db_pool).await?;
         }
@@ -334,13 +436,37 @@ pub async fn fetch_and_save_logs_ws(
         error_count
     );
 
-    // Update sync log
+    // Update sync log with verified block hash
     let sync_log = EvmSyncLogs::find_by_address(&address, &db_pool).await?;
     if let Some(sync) = sync_log {
         sync.update_last_synced_block_number(to_block, &mut *tx).await
             .map_err(|e| AppError::Database(e))?;
+        
+        // Store the verified block hash for next continuity check
+        if let Some((hash, _)) = verified_hashes.last() {
+            sqlx::query(
+                "UPDATE evm_sync_logs SET last_synced_block_hash = $1 WHERE address = $2"
+            )
+            .bind(&hash[..])
+            .bind(&sync.address[..])
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| AppError::Database(e))?;
+        }
     } else {
-        EvmSyncLogs::create(&address, chain_id, Some(to_block as i64), &mut *tx).await?;
+        let new_sync = EvmSyncLogs::create(&address, chain_id, Some(to_block as i64), &mut *tx).await?;
+        
+        // Store the verified block hash
+        if let Some((hash, _)) = verified_hashes.last() {
+            sqlx::query(
+                "UPDATE evm_sync_logs SET last_synced_block_hash = $1 WHERE address = $2"
+            )
+            .bind(&hash[..])
+            .bind(&new_sync.address[..])
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| AppError::Database(e))?;
+        }
     }
 
     match tx.commit().await {
@@ -573,23 +699,28 @@ async fn try_ws_connection(
         println!("Catchup complete, now listening for new blocks via WebSocket...");
     }
 
-    // Use WebSocket provider for faster polling (lower latency than HTTP)
-    // WebSocket maintains persistent connection, reducing overhead
+    // Live mode: Only process blocks up to safe_head (finalized blocks)
+    // This prevents processing unfinalized blocks that might get reorged
     let mut last_seen_block = *current_block - 1;
     let mut consecutive_no_new_blocks = 0;
     
     loop {
-        // Poll for new blocks using WebSocket (faster than HTTP)
+        // Get latest block and calculate safe head
         let latest_block = provider
             .get_block_number()
             .await
             .map_err(|e| AppError::RPCError(format!("Failed to get block number: {e}")))?;
 
-        if latest_block > last_seen_block {
-            // New block(s) available
+        let safe_head = get_safe_head(&provider).await?;
+        
+        // Only process up to safe_head (conservative approach)
+        // This ensures we only process finalized blocks, reducing reorg risk
+        let to_block = std::cmp::min(latest_block, safe_head);
+
+        if to_block > last_seen_block {
+            // New finalized block(s) available
             consecutive_no_new_blocks = 0;
             let from_block = *current_block;
-            let to_block = latest_block;
 
             match fetch_and_save_logs_ws(chain_id, db_pool.clone(), address.clone(), from_block, to_block, &provider)
                 .await
@@ -597,23 +728,29 @@ async fn try_ws_connection(
                 Ok(last_synced) => {
                     *current_block = last_synced + 1;
                     last_seen_block = last_synced;
-                    println!("New block {} synced for {address} (via WebSocket)", last_synced);
+                    let blocks_behind = latest_block.saturating_sub(last_synced);
+                    println!(
+                        "New finalized block {} synced for {address} (via WebSocket, {} blocks behind latest)",
+                        last_synced,
+                        blocks_behind
+                    );
                 }
                 Err(e) => {
                     return Err(e);
                 }
             }
         } else {
-            // No new blocks yet
+            // No new finalized blocks yet
             consecutive_no_new_blocks += 1;
-            // Use shorter polling interval with WebSocket (faster than HTTP)
-            // WebSocket connection stays alive, so this is efficient
-            sleep(Duration::from_millis(500)).await;
+            // Wait for finality (blocks need time to finalize)
+            sleep(Duration::from_secs(1)).await;
             
-            // Log every 10 seconds if no new blocks
-            if consecutive_no_new_blocks % 20 == 0 {
-                println!("⏳ Waiting for new blocks... (current: {}, latest: {})", 
-                         last_seen_block, latest_block);
+            // Log every 10 seconds if no new finalized blocks
+            if consecutive_no_new_blocks % 10 == 0 {
+                println!(
+                    "⏳ Waiting for finalized blocks... (synced: {}, latest: {}, safe_head: {})", 
+                    last_seen_block, latest_block, safe_head
+                );
             }
         }
     }

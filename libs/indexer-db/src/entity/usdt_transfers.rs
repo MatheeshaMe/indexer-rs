@@ -55,7 +55,22 @@ impl UsdtTransfers {
             .fetch_one(connection)
             .await
     }
-    // pub async fn upate_usdt_transfer<'c,E>(&self,tx_hash: Vec<u8>,connection: E) -> Result<UsdtTransfers,sqlx::Error> where E: Executor<'c,Database=Postgres>{
-    //     let query = "UPDATE usdt_transfers SET"
-    // }
+
+    /// Delete transfers by transaction hash and block number (for reorg cleanup)
+    pub async fn delete_by_tx_hash_and_block<'c, E>(
+        tx_hash: &[u8; 32],
+        block_number: &BigDecimal,
+        connection: E,
+    ) -> Result<u64, sqlx::Error>
+    where
+        E: Executor<'c, Database = Postgres>,
+    {
+        let result = sqlx::query("DELETE FROM usdt_transfers WHERE tx_hash = $1 AND block_number = $2")
+            .bind(&tx_hash[..])
+            .bind(block_number)
+            .execute(connection)
+            .await?;
+
+        Ok(result.rows_affected() as u64)
+    }
 }

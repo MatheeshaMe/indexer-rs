@@ -123,26 +123,35 @@ impl USDTErc20 {
             created_at: chrono::Utc::now().naive_utc(), // Will be set by database, but set here for completeness
         };
          println!("transfer_processing: {:?}",transfer);
-        // Insert into database
-        // Pool<Postgres> implements Executor, so we can use it directly
+        // Insert into database with idempotency handling
+        // The ON CONFLICT clause in UsdtTransfers::create ensures idempotency
         match UsdtTransfers::create(transfer.clone(), connection).await {
-            Ok(result) => {
+            Ok(_result) => {
                 println!(
                     "USDT Transfer stored: from {from:?} to {to:?} value {}",
                     value_u256
                 );
-                return Ok(())
+                Ok(())
+            }
+            Err(sqlx::Error::Database(db_err)) if db_err.code().as_deref() == Some("23505") => {
+                // Unique constraint violation - transfer already exists (idempotent)
+                // This is OK, means we're reprocessing or duplicate was prevented
+                println!(
+                    "USDT Transfer already exists (idempotent): tx_hash={:?}, skipping",
+                    transfer.tx_hash
+                );
+                Ok(())
             }
             Err(e) => {
-                // Print the actual SQLx error details
+                // Other database errors are real failures
                 eprintln!("Failed to insert USDT transfer:");
                 eprintln!("  Error: {}", e);
                 eprintln!("  Error type: {:?}", e);
                 eprintln!("  Transfer: tx_hash={:?}, from={:?}, to={:?}, value={}, chain_id={}", 
                     transfer.tx_hash, transfer.from_address, transfer.to_address, transfer.value, transfer.chain_id);
-                 return Err(AppError::Sqlx { source: e })
+                Err(AppError::Sqlx { source: e })
             }
-        };
+        }
         // println!(
         //     "USDT Transfer stored: from {from:?} to {to:?} value {}",
         //     value_u256
