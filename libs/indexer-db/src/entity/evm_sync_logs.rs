@@ -4,6 +4,7 @@ use sqlx::{types::chrono, Executor, Postgres};
 pub struct EvmSyncLogs {
     pub address: [u8; 20],
     pub last_synced_block_number: i64,
+    pub last_synced_block_hash: Option<Vec<u8>>,
 
     pub created_at: chrono::NaiveDateTime,
     pub updated_at: chrono::NaiveDateTime,

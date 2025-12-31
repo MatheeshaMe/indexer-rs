@@ -31,8 +31,9 @@ pub struct EvmLogs {
     pub log_index: i64,
     pub removed: bool,
     pub created_at: chrono::NaiveDateTime,
+    pub is_final:bool,
 }
-
+ 
 impl TryInto<Log> for EvmLogs {
     type Error = EvmLogsError;
 
@@ -110,8 +111,8 @@ impl EvmLogs {
 
         // Insert log into the database and return the inserted row
         let query = r#"
-            INSERT INTO evm_logs (block_hash, block_number, address, transaction_hash, transaction_index, event_signature, topics, data, log_index, removed)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            INSERT INTO evm_logs (block_hash, block_number, address, transaction_hash, transaction_index, event_signature, topics, data, log_index, removed, is_final)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             RETURNING *
         "#;
         println!("logs for {:?} {:?} {:?} {:?}",address,topics,log_data,log_index);
@@ -126,6 +127,7 @@ impl EvmLogs {
             .bind(log_data)
             .bind(log_index)
             .bind(log.removed)
+            .bind(false) // is_final = false for new logs
             .fetch_one(connection)
             .await
     }

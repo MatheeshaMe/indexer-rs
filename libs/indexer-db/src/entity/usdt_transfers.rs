@@ -1,6 +1,7 @@
 use sqlx::{Executor, Postgres, types::{BigDecimal, chrono}};
 
 #[derive(sqlx::FromRow,Debug,Clone)]
+
 pub struct UsdtTransfers{
     pub id: i64,
     pub tx_hash: [u8; 32],
@@ -21,10 +22,14 @@ impl UsdtTransfers {
         let query = r#"
         INSERT INTO usdt_transfers (tx_hash, block_number, block_timestamp, from_address, to_address, value, classification, chain_id)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-        ON CONFLICT (tx_hash, from_address, to_address, value, block_number) DO NOTHING
+        ON CONFLICT (tx_hash, from_address, to_address, value, block_number) 
+        DO UPDATE SET 
+            block_timestamp = EXCLUDED.block_timestamp,
+            classification = EXCLUDED.classification
         RETURNING *
     "#;
         println!("query {}",query);
+        
         sqlx::query_as::<_, UsdtTransfers>(query)
             .bind(transfer.tx_hash)
             .bind(transfer.block_number)

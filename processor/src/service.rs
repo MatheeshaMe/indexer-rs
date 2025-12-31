@@ -34,10 +34,10 @@ pub async fn process_logs(db_pool: &Pool<Postgres>) -> Result<(), Box<dyn Error>
                     match processor.process(log, &service_db_pool, chain_id).await {
                         Ok(_) => {
                             if let Err(error) = EvmLogs::delete(log_id, &service_db_pool).await {
-                                eprintln!("{}", error)
+                                eprintln!("Failed to delete processed log {}: {}", log_id, error)
                             }
                         }
-                        Err(error) => eprintln!("{}", error),
+                        Err(error) => eprintln!("Failed to process log {}: {}", log_id, error),
                     }
                 });
             }
