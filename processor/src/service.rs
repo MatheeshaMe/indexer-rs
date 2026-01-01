@@ -1,4 +1,8 @@
 use indexer_db::entity::{evm_logs::EvmLogs, usdt_transfers::UsdtTransfers};
+use indexer_metrics::{
+    PROCESSOR_LOGS_PROCESSED, PROCESSOR_LOGS_ERRORS, PROCESSOR_PROCESSING_DURATION,
+    PROCESSOR_BATCH_SIZE, PROCESSOR_CLEANUP_REMOVED,
+};
 use sqlx::{Pool, Postgres};
 use std::{collections::BTreeMap, env, error::Error};
 
@@ -28,6 +32,10 @@ pub async fn process_logs(db_pool: &Pool<Postgres>) -> Result<(), Box<dyn Error>
         return Ok(());
     }
 
+    PROCESSOR_BATCH_SIZE
+        .with_label_values(&[&chain_id_str])
+        .set(unprocessed_logs.len() as f64);
+
     // Group logs by block_number, then by transaction_hash, maintaining order
     // BTreeMap ensures sorted order by key
     let mut logs_by_block: BTreeMap<String, BTreeMap<String, Vec<EvmLogs>>> = BTreeMap::new();
@@ -51,30 +59,48 @@ pub async fn process_logs(db_pool: &Pool<Postgres>) -> Result<(), Box<dyn Error>
     let mut processed_count = 0;
     let mut error_count = 0;
 
-    for (block_num_str, txs) in logs_by_block {
-        for (tx_hash_hex, mut logs) in txs {
+    for (_block_num_str, txs) in logs_by_block {
+        for (_tx_hash_hex, mut logs) in txs {
             // Sort logs by log_index within transaction
             logs.sort_by_key(|l| l.log_index);
 
             // Process logs sequentially within transaction
             for log in logs {
                 let processor_result = contract_registry.get_processor(log.address);
+                let contract_name = contract_registry.get_contract_name(log.address)
+                    .unwrap_or_else(|| "unknown".to_string());
                 let log_id = log.id; // Store ID before moving log
 
                 match processor_result {
                     Ok(processor) => {
+                        let timer = PROCESSOR_PROCESSING_DURATION
+                            .with_label_values(&[&chain_id_str, &contract_name])
+                            .start_timer();
+
                         match processor.process(log, db_pool, chain_id).await {
                             Ok(_) => {
                                 if let Err(error) = EvmLogs::mark_as_processed(log_id, db_pool).await {
+                                    timer.observe_duration();
                                     eprintln!("Failed to mark log {} as final: {}", log_id, error);
                                     error_count += 1;
+                                    PROCESSOR_LOGS_ERRORS
+                                        .with_label_values(&[&chain_id_str, &contract_name, "mark_processed"])
+                                        .inc();
                                 } else {
+                                    timer.observe_duration();
                                     processed_count += 1;
+                                    PROCESSOR_LOGS_PROCESSED
+                                        .with_label_values(&[&chain_id_str, &contract_name])
+                                        .inc();
                                 }
                             }
                             Err(error) => {
+                                timer.observe_duration();
                                 eprintln!("Failed to process log {}: {}", log_id, error);
                                 error_count += 1;
+                                PROCESSOR_LOGS_ERRORS
+                                    .with_label_values(&[&chain_id_str, &contract_name, "process"])
+                                    .inc();
                             }
                         }
                     }
@@ -84,6 +110,9 @@ pub async fn process_logs(db_pool: &Pool<Postgres>) -> Result<(), Box<dyn Error>
                             eprintln!("  SQLx error details: {}", source);
                         }
                         error_count += 1;
+                        PROCESSOR_LOGS_ERRORS
+                            .with_label_values(&[&chain_id_str, &contract_name, "get_processor"])
+                            .inc();
                     }
                 }
             }
@@ -102,6 +131,9 @@ pub async fn cleanup_removed_logs(db_pool: &Pool<Postgres>) -> Result<(), Box<dy
     let batch_size: i32 = env::var("BATCH_SIZE")
         .or::<String>(Ok(defaults::BATCH_SIZE.into()))?
         .parse::<i32>()?;
+
+    let chain_id_str = env::var("CHAIN_ID")
+        .unwrap_or_else(|_| "0".to_string());
 
     let removed_logs = EvmLogs::find_processed_but_removed(batch_size, db_pool).await?;
 
@@ -146,6 +178,9 @@ pub async fn cleanup_removed_logs(db_pool: &Pool<Postgres>) -> Result<(), Box<dy
     }
 
     if cleaned_count > 0 {
+        PROCESSOR_CLEANUP_REMOVED
+            .with_label_values(&[&chain_id_str])
+            .inc_by(cleaned_count as f64);
         println!("Cleanup complete: Removed {} transfer records from {} logs ({} errors)", 
                  cleaned_count, logs_count, error_count);
     }

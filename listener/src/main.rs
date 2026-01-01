@@ -7,6 +7,7 @@ use tokio::task::JoinSet;
 
 mod error;
 mod service;
+mod metrics_server;
 
 /// Run backfill phase for all addresses
 async fn run_backfill(
@@ -36,11 +37,11 @@ async fn run_backfill(
                         // No sleep - maximum speed for backfill
                     }
                     Err(AppError::BackfillComplete) => {
-                        println!("✅ Backfill complete for {}", address_clone);
+                        println!("Backfill complete for {}", address_clone);
                         break; // Backfill finished for this address
                     }
                     Err(err) => {
-                        eprintln!("❌ Backfill error for {}: {:?}, retrying...", address_clone, err);
+                        eprintln!("Backfill error for {}: {:?}, retrying...", address_clone, err);
                         // Only sleep on error to avoid hammering RPC
                         tokio::time::sleep(Duration::from_secs(1)).await;
                     }
@@ -56,7 +57,7 @@ async fn run_backfill(
         }
     }
 
-    println!("✅ BACKFILL phase complete for all addresses");
+    println!("BACKFILL phase complete for all addresses");
     Ok(())
 }
 
@@ -143,8 +144,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Addresses: {}", addresses.join(", "));
     println!("==========================================");
 
+    // Start metrics server
+    let metrics_port = env::var("METRICS_PORT")
+        .unwrap_or_else(|_| "9091".to_string())
+        .parse::<u16>()
+        .unwrap_or(9091);
+    
+    tokio::spawn(async move {
+        if let Err(e) = metrics_server::start_metrics_server(metrics_port).await {
+            eprintln!("Metrics server error: {}", e);
+        }
+    });
+
     // PHASE 1: BACKFILL (finite, HTTP)
-    println!("\n🚀 PHASE 1: BACKFILL (HTTP)");
+    println!("\nPHASE 1: BACKFILL (HTTP)");
     match run_backfill(
         chain_id,
         addresses.clone(),
@@ -154,16 +167,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await
     {
         Ok(()) => {
-            println!("✅ Backfill phase completed successfully");
+            println!("Backfill phase completed successfully");
         }
         Err(e) => {
-            eprintln!("❌ Backfill phase error: {:?}", e);
+            eprintln!("Backfill phase error: {:?}", e);
             return Err(e.into());
         }
     }
 
     // PHASE 2: LIVE WS (infinite, never returns)
-    println!("\n🌐 PHASE 2: LIVE WEBSOCKET");
+    println!("\nPHASE 2: LIVE WEBSOCKET");
     println!("Switching to live mode...");
     run_ws(chain_id, addresses, db_pool).await;
 }

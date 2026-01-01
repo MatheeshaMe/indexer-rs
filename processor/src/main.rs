@@ -8,6 +8,7 @@ mod contracts;
 mod error;
 mod service;
 mod utils;
+mod metrics_server;
 
 mod defaults {
     pub const POLL_INTERVAL: &str = "10";
@@ -23,9 +24,32 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let sleep_duration = Duration::from_secs(poll_interval);
 
+    // Start metrics server
+    let metrics_port = env::var("METRICS_PORT")
+        .unwrap_or_else(|_| "9092".to_string())
+        .parse::<u16>()
+        .unwrap_or(9092);
+    
+    tokio::spawn(async move {
+        if let Err(e) = metrics_server::start_metrics_server(metrics_port).await {
+            eprintln!("Metrics server error: {}", e);
+        }
+    });
+
+    let chain_id = env::var("CHAIN_ID")
+        .unwrap_or_else(|_| "0".to_string());
+
     loop {
         let unprocessed_count = match EvmLogs::count_unprocessed(&db_pool).await {
-            Ok(count) => count,
+            Ok(count) => {
+                // Update metrics
+                if let Some(count) = count {
+                    indexer_metrics::PROCESSOR_UNPROCESSED_LOGS
+                        .with_label_values(&[&chain_id])
+                        .set(count as f64);
+                }
+                count
+            }
             Err(err) => {
                 eprintln!(
                     "Error counting unprocessed logs: {err}. Sleeping for {} seconds...",

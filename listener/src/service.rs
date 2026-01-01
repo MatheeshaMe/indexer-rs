@@ -8,6 +8,12 @@ use alloy::{
 };
 use futures_util::StreamExt;
 use indexer_db::entity::{blocks::Block, evm_logs::EvmLogs, evm_sync_logs::EvmSyncLogs};
+use indexer_metrics::{
+    LISTENER_BLOCKS_SYNCED, LISTENER_LOGS_FETCHED, LISTENER_LOGS_SAVED,
+    LISTENER_LOGS_REMOVED, LISTENER_RPC_ERRORS, LISTENER_DB_ERRORS,
+    LISTENER_REORGS_DETECTED, LISTENER_CURRENT_BLOCK, LISTENER_BLOCKS_BEHIND,
+    LISTENER_RPC_REQUEST_DURATION,
+};
 use sqlx::{Pool, Postgres};
 use tokio::time::sleep;
 
@@ -142,13 +148,19 @@ pub async fn fetch_and_save_logs(
     from_block: u64,
     to_block: u64,
 ) -> Result<u64, AppError> {
+    let chain_id_str = chain_id.to_string();
     let rpc_url: String =
         env::var("RPC_URL").map_err(|_| AppError::MissingEnvVar("RPC_URL".into()))?;
 
     let provider = ProviderBuilder::new()
         .on_builtin(&rpc_url)
         .await
-        .map_err(|e| AppError::RPCError(format!("Provider Error Happened {}", e)))?;
+        .map_err(|e| {
+            LISTENER_RPC_ERRORS
+                .with_label_values(&[&chain_id_str, &address, "provider_init"])
+                .inc();
+            AppError::RPCError(format!("Provider Error Happened {}", e))
+        })?;
 
     let contract_address = Address::from_str(&address)
         .map_err(|e| AppError::InvalidAddress(format!("Invalid Address {e}")))?;
@@ -158,10 +170,23 @@ pub async fn fetch_and_save_logs(
         .from_block(BlockNumberOrTag::Number(from_block))
         .to_block(BlockNumberOrTag::Number(to_block));
 
-    let logs = provider
-        .get_logs(&filter)
-        .await
-        .map_err(|e| AppError::RPCError(format!("Error in getting logs {}", e)))?;
+    let timer = LISTENER_RPC_REQUEST_DURATION
+        .with_label_values(&[&chain_id_str, &address, "get_logs"])
+        .start_timer();
+
+    let logs = match provider.get_logs(&filter).await {
+        Ok(logs) => {
+            drop(timer);
+            logs
+        }
+        Err(e) => {
+            drop(timer);
+            LISTENER_RPC_ERRORS
+                .with_label_values(&[&chain_id_str, &address, "get_logs"])
+                .inc();
+            return Err(AppError::RPCError(format!("Error in getting logs {}", e)));
+        }
+    };
 
     println!(
         "Fetched {} logs from RPC for blocks {} to {}",
@@ -169,6 +194,14 @@ pub async fn fetch_and_save_logs(
         from_block,
         to_block
     );
+
+    LISTENER_LOGS_FETCHED
+        .with_label_values(&[&chain_id_str, &address])
+        .inc_by(logs.len() as f64);
+
+    LISTENER_BLOCKS_SYNCED
+        .with_label_values(&[&chain_id_str, &address])
+        .inc_by((to_block - from_block + 1) as f64);
 
     if logs.is_empty() {
         // Even if no logs, store the last block in blocks table for WS verification
@@ -226,6 +259,9 @@ pub async fn fetch_and_save_logs(
             }
             Err(e) => {
                 error_count += 1;
+                LISTENER_DB_ERRORS
+                    .with_label_values(&[&chain_id_str, &address])
+                    .inc();
                 eprintln!("Failed to save log: {:?}", e);
                 // Continue processing other logs
             }
@@ -238,6 +274,10 @@ pub async fn fetch_and_save_logs(
         logs_count,
         error_count
     );
+
+    LISTENER_LOGS_SAVED
+        .with_label_values(&[&chain_id_str, &address])
+        .inc_by(saved_count as f64);
 
     // Update sync log with block number and hash
     if let Some(sync) = sync_log {
@@ -278,9 +318,15 @@ pub async fn fetch_and_save_logs(
                 "Committed transaction: Saved {} logs for {address}, blocks: {from_block} to {to_block}",
                 saved_count
             );
+            LISTENER_CURRENT_BLOCK
+                .with_label_values(&[&chain_id_str, &address])
+                .set(to_block as f64);
             Ok(to_block)
         }
         Err(e) => {
+            LISTENER_DB_ERRORS
+                .with_label_values(&[&chain_id_str, &address])
+                .inc();
             eprintln!("Transaction commit failed: {:?}", e);
             Err(AppError::Database(e))
         }
@@ -297,6 +343,7 @@ pub async fn fetch_and_save_logs_ws(
     to_block: u64,
     provider: &impl Provider,
 ) -> Result<u64, AppError> {
+    let chain_id_str = chain_id.to_string();
     let contract_address = Address::from_str(&address)
         .map_err(|e| AppError::InvalidAddress(format!("Invalid Address {e}")))?;
 
@@ -337,6 +384,9 @@ pub async fn fetch_and_save_logs_ws(
             }
             Err(AppError::ReorgDetected(block)) => {
                 eprintln!("Reorg detected at block {} via hash continuity check", block);
+                LISTENER_REORGS_DETECTED
+                    .with_label_values(&[&chain_id_str, &address])
+                    .inc();
                 // Mark all logs from this block onwards as removed
                 let address_array: [u8; 20] = (*contract_address).into();
                 let mut tx = db_pool.begin().await?;
@@ -351,6 +401,9 @@ pub async fn fetch_and_save_logs_ws(
                 tx.commit().await?;
                 
                 if marked > 0 {
+                    LISTENER_LOGS_REMOVED
+                        .with_label_values(&[&chain_id_str, &address])
+                        .inc_by(marked as f64);
                     println!("Marked {} logs as removed due to reorg at block {}", marked, block);
                 }
                 
@@ -365,10 +418,23 @@ pub async fn fetch_and_save_logs_ws(
         .from_block(BlockNumberOrTag::Number(from_block))
         .to_block(BlockNumberOrTag::Number(to_block));
 
-    let logs = provider
-        .get_logs(&filter)
-        .await
-        .map_err(|e| AppError::RPCError(format!("Error in getting logs {}", e)))?;
+    let timer = LISTENER_RPC_REQUEST_DURATION
+        .with_label_values(&[&chain_id_str, &address, "get_logs"])
+        .start_timer();
+
+    let logs = match provider.get_logs(&filter).await {
+        Ok(logs) => {
+            drop(timer);
+            logs
+        }
+        Err(e) => {
+            drop(timer);
+            LISTENER_RPC_ERRORS
+                .with_label_values(&[&chain_id_str, &address, "get_logs"])
+                .inc();
+            return Err(AppError::RPCError(format!("Error in getting logs {}", e)));
+        }
+    };
 
     println!(
         "Fetched {} logs from WebSocket for blocks {} to {} (hash continuity verified)",
@@ -376,6 +442,14 @@ pub async fn fetch_and_save_logs_ws(
         from_block,
         to_block
     );
+
+    LISTENER_LOGS_FETCHED
+        .with_label_values(&[&chain_id_str, &address])
+        .inc_by(logs.len() as f64);
+
+    LISTENER_BLOCKS_SYNCED
+        .with_label_values(&[&chain_id_str, &address])
+        .inc_by((to_block - from_block + 1) as f64);
 
     if logs.is_empty() {
         // Still update sync log even if no logs, but with verified block hash
@@ -437,6 +511,9 @@ pub async fn fetch_and_save_logs_ws(
             .map_err(|e| AppError::Database(e))?;
             
             if marked > 0 {
+                LISTENER_LOGS_REMOVED
+                    .with_label_values(&[&chain_id_str, &address])
+                    .inc_by(marked as f64);
                 println!("Marked {} logs as removed for block {} (reorg detected)", marked, block_num);
             }
         }
@@ -450,6 +527,9 @@ pub async fn fetch_and_save_logs_ws(
             }
             Err(e) => {
                 error_count += 1;
+                LISTENER_DB_ERRORS
+                    .with_label_values(&[&chain_id_str, &address])
+                    .inc();
                 eprintln!("Failed to save log: {:?}", e);
             }
         }
@@ -462,6 +542,10 @@ pub async fn fetch_and_save_logs_ws(
         removed_count,
         error_count
     );
+
+    LISTENER_LOGS_SAVED
+        .with_label_values(&[&chain_id_str, &address])
+        .inc_by(saved_count as f64);
 
     // Update sync log with verified block hash
     let sync_log = EvmSyncLogs::find_by_address(&address, &db_pool).await?;
@@ -502,9 +586,15 @@ pub async fn fetch_and_save_logs_ws(
                 "Committed transaction: Saved {} logs, marked {} removed for {address}, blocks: {from_block} to {to_block}",
                 saved_count, removed_count
             );
+            LISTENER_CURRENT_BLOCK
+                .with_label_values(&[&chain_id_str, &address])
+                .set(to_block as f64);
             Ok(to_block)
             }
             Err(e) => {
+                LISTENER_DB_ERRORS
+                    .with_label_values(&[&chain_id_str, &address])
+                    .inc();
                 eprintln!("Transaction commit failed: {:?}", e);
             Err(AppError::Database(e))
         }
@@ -589,6 +679,12 @@ pub async fn run_backfill_once(
                 let blocks_behind = updated_latest.saturating_sub(last_synced);
                 let blocks_remaining = safe_head.saturating_sub(last_synced);
                 let total_synced = last_synced.saturating_sub(from_block) + 1;
+                
+                // Update metrics
+                let chain_id_str = chain_id.to_string();
+                LISTENER_BLOCKS_BEHIND
+                    .with_label_values(&[&chain_id_str, &address])
+                    .set(blocks_behind as f64);
                 
                 if total_blocks_to_sync > 0 {
                     let progress_pct = (total_synced as f64 / total_blocks_to_sync as f64 * 100.0).min(100.0);

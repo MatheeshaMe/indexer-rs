@@ -1,0 +1,9 @@
+[package]
+name = "indexer-metrics"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+prometheus = { workspace = true }
+lazy_static = { workspace = true }
+
