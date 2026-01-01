@@ -1,4 +1,4 @@
-use std::{env, str::FromStr, time::Duration, fs::OpenOptions, io::Write};
+use std::{env, str::FromStr, time::Duration};
 
 use alloy::{
     eips::BlockNumberOrTag,
@@ -63,7 +63,7 @@ pub async fn verify_block_hash_continuity(
             BlockNumberOrTag::Number(block_number),
             BlockTransactionsKind::Full,
         )
-        .await
+            .await
         .map_err(|e| AppError::RPCError(format!("Failed to get block {}: {e}", block_number)))?
         .ok_or_else(|| AppError::RPCError(format!("Block {} not found", block_number)))?;
 
@@ -171,7 +171,33 @@ pub async fn fetch_and_save_logs(
     );
 
     if logs.is_empty() {
+        // Even if no logs, store the last block in blocks table for WS verification
+        if let Ok(Some(block)) = provider
+            .get_block_by_number(BlockNumberOrTag::Number(to_block), BlockTransactionsKind::Full)
+            .await
+        {
+            let hash: [u8; 32] = block.header.hash.into();
+            let parent: [u8; 32] = block.header.parent_hash.into();
+            if let Err(e) = Block::create_or_update(to_block, hash, parent, &db_pool).await {
+                eprintln!("Warning: Failed to store block {} in blocks table: {}", to_block, e);
+            }
+        }
         return Ok(to_block);
+    }
+
+    // Store all blocks in the range in blocks table (needed for WS verification)
+    // This ensures continuity checks work correctly when WS starts
+    for block_num in from_block..=to_block {
+        if let Ok(Some(block)) = provider
+            .get_block_by_number(BlockNumberOrTag::Number(block_num), BlockTransactionsKind::Full)
+            .await
+        {
+            let hash: [u8; 32] = block.header.hash.into();
+            let parent: [u8; 32] = block.header.parent_hash.into();
+            if let Err(e) = Block::create_or_update(block_num, hash, parent, &db_pool).await {
+                eprintln!("Warning: Failed to store block {} in blocks table: {}", block_num, e);
+            }
+        }
     }
 
     // Get block hash for tracking (not for reorg detection in backfill - blocks are final)
@@ -245,8 +271,8 @@ pub async fn fetch_and_save_logs(
             .map_err(|e| AppError::Database(e))?;
         }
     }
-
-    match tx.commit().await {
+      
+        match tx.commit().await {
         Ok(_) => {
             println!(
                 "Committed transaction: Saved {} logs for {address}, blocks: {from_block} to {to_block}",
@@ -477,9 +503,9 @@ pub async fn fetch_and_save_logs_ws(
                 saved_count, removed_count
             );
             Ok(to_block)
-        }
-        Err(e) => {
-            eprintln!("Transaction commit failed: {:?}", e);
+            }
+            Err(e) => {
+                eprintln!("Transaction commit failed: {:?}", e);
             Err(AppError::Database(e))
         }
     }
@@ -775,61 +801,30 @@ async fn try_ws_connection(
         let needs_verification = last_verified_block != Some(block_number);
         
         if needs_verification {
-            // #region agent log
-            let log_path = "/home/hpms/web3-indexing/indexer-rs/.cursor/debug.log";
-            let mut log_file = OpenOptions::new().create(true).append(true).open(log_path).ok();
-            if let Some(ref mut f) = log_file {
-                let _ = writeln!(f, r#"{{"sessionId":"debug-session","runId":"pre-fix","hypothesisId":"A","location":"listener/src/service.rs:777","message":"Verification start","data":{{"block_number":{},"address":"{}"}},"timestamp":{}}}"#, block_number, address, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
-            }
-            // #endregion
-            
-            let sync_log = EvmSyncLogs::find_by_address(&address, &db_pool).await?;
-            let last_synced_block = sync_log.as_ref().map(|s| s.last_synced_block_number).unwrap_or(-1);
-            let expected_parent_hash = sync_log
-                .as_ref()
-                .and_then(|s| s.last_synced_block_hash.as_ref())
-                .and_then(|h| {
-                    if h.len() == 32 {
-                        let mut arr = [0u8; 32];
-                        arr.copy_from_slice(h);
-                        Some(arr)
-                    } else {
-                        None
-                    }
-                });
-            
-            // #region agent log
-            if let Some(ref mut f) = log_file {
-                let expected_hex = expected_parent_hash.map(|h| format!("0x{}", hex::encode(h))).unwrap_or_else(|| "None".to_string());
-                let _ = writeln!(f, r#"{{"sessionId":"debug-session","runId":"pre-fix","hypothesisId":"A","location":"listener/src/service.rs:790","message":"Sync state","data":{{"last_synced_block":{},"expected_parent_hash":"{}"}},"timestamp":{}}}"#, last_synced_block, expected_hex, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
-            }
-            // #endregion
-            
             // Check if parent block exists in blocks table
             let parent_block_num = block_number.saturating_sub(1);
             let parent_block_in_db = Block::find_by_number(parent_block_num, &db_pool).await.ok().flatten();
             
-            // #region agent log
-            if let Some(ref mut f) = log_file {
-                let parent_hash_in_db = parent_block_in_db.as_ref().map(|b| format!("0x{}", hex::encode(b.block_hash))).unwrap_or_else(|| "None".to_string());
-                let _ = writeln!(f, r#"{{"sessionId":"debug-session","runId":"pre-fix","hypothesisId":"B","location":"listener/src/service.rs:795","message":"Parent block check","data":{{"parent_block_num":{},"parent_exists_in_db":{},"parent_hash_in_db":"{}"}},"timestamp":{}}}"#, parent_block_num, parent_block_in_db.is_some(), parent_hash_in_db, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
-            }
-            // #endregion
-            
-            // Verify block hash continuity
-            match verify_block_hash_continuity(
-                &provider,
-                block_number,
-                expected_parent_hash,
-            ).await {
-                Ok((current_hash, _parent_hash)) => {
-                    // Verification successful - cache the result
-                    last_verified_block = Some(block_number);
-                    last_verified_hash = Some(current_hash);
-                }
-                Err(AppError::ReorgDetected(block)) => {
-                    // Reorg detected - handle it properly
-                    eprintln!("Reorg detected at block {} via hash continuity - handling reorg...", block);
+            // CRITICAL FIX: Only verify if parent block exists in blocks table
+            // Do NOT fall back to last_synced_block_hash - it can be stale and cause false positives
+            // This is because backfill doesn't store blocks in blocks table, only updates evm_sync_logs
+            if let Some(parent_block) = &parent_block_in_db {
+                // Parent block exists in DB - use its hash for verification (reliable)
+                let expected_parent_hash = Some(parent_block.block_hash);
+                // Verify block hash continuity
+                match verify_block_hash_continuity(
+                    &provider,
+                    block_number,
+                    expected_parent_hash,
+                ).await {
+                    Ok((current_hash, _parent_hash)) => {
+                        // Verification successful - cache the result
+                        last_verified_block = Some(block_number);
+                        last_verified_hash = Some(current_hash);
+                    }
+                    Err(AppError::ReorgDetected(block)) => {
+                        // Reorg detected - handle it properly
+                        eprintln!("Reorg detected at block {} via hash continuity - handling reorg...", block);
                     
                     // Mark all logs from the reorged block onwards as removed
                     let address_array: [u8; 20] = contract_address.into();
@@ -879,50 +874,64 @@ async fn try_ws_connection(
                     // Future logs from this block will also be skipped by the block_number < current_block check
                     continue;
                 }
-                Err(e) => {
-                    eprintln!("Error verifying block hash continuity: {:?}", e);
-                    continue; // Skip this log on error
+                    Err(e) => {
+                        eprintln!("Error verifying block hash continuity: {:?}", e);
+                        continue; // Skip this log on error
+                    }
                 }
+            } else {
+                // Parent block not in blocks table - skip verification to avoid false positives
+                // This can happen if:
+                // 1. First WS block after backfill (backfill doesn't store blocks in blocks table)
+                // 2. Out-of-order block delivery
+                // We'll verify it when the parent block is stored (after it's processed)
             }
         }
         
         // Extract block_hash before moving log
         let log_block_hash = log.block_hash;
+        
+        // Store block in blocks table if not already stored (needed for future continuity checks)
+        // This is important even if verification was skipped
+        if last_verified_block != Some(block_number) {
+            // Fetch block from RPC to get hash and parent hash
+            if let Ok(Some(block)) = provider
+                .get_block_by_number(BlockNumberOrTag::Number(block_number), BlockTransactionsKind::Full)
+                .await
+            {
+                let current_hash: [u8; 32] = block.header.hash.into();
+                let parent_hash: [u8; 32] = block.header.parent_hash.into();
+                if let Err(e) = Block::create_or_update(block_number, current_hash, parent_hash, &db_pool).await {
+                    eprintln!("Warning: Failed to store block {} in blocks table: {}", block_number, e);
+                } else {
+                    // Cache the hash for sync state update
+                    last_verified_hash = Some(current_hash);
+                }
+            }
+        }
                     
-        // Save the log (block already verified)
+        // Save the log (block already verified or stored)
         match EvmLogs::create(log, &db_pool).await {
             Ok(_saved_log) => {
                 // Update sync state (only once per block, use cached hash if available)
-                if last_verified_block == Some(block_number) {
-                    let sync_log = EvmSyncLogs::find_by_address(&address, &db_pool).await?;
-                    if let Some(sync) = sync_log {
-                        // Only update if we haven't already synced this block
-                        if sync.last_synced_block_number < block_number as i64 {
-                            sync.update_last_synced_block_number(block_number, &db_pool).await
-                                .map_err(|e| AppError::Database(e))?;
-                            
-                            // Store block hash (use cached hash from verification)
-                            if let Some(hash) = last_verified_hash.or_else(|| log_block_hash.map(|h| h.into())) {
-                                sqlx::query(
-                                    "UPDATE evm_sync_logs SET last_synced_block_hash = $1 WHERE address = $2"
-                                )
-                                .bind(&hash[..])
-                                .bind(&sync.address[..])
-                                .execute(&db_pool)
-                                .await
-                                .map_err(|e| AppError::Database(e))?;
-                                
-                                // Store block in blocks table for tracking
-                                if let Ok(Some(block)) = provider
-                                    .get_block_by_number(BlockNumberOrTag::Number(block_number), BlockTransactionsKind::Full)
-                                    .await
-                                {
-                                    let parent_hash: [u8; 32] = block.header.parent_hash.into();
-                                    if let Err(e) = Block::create_or_update(block_number, hash, parent_hash, &db_pool).await {
-                                        eprintln!("Warning: Failed to store block {} in blocks table: {}", block_number, e);
-                                    }
-                                }
-                            }
+                // Update even if verification was skipped, as long as we have a hash
+                let sync_log = EvmSyncLogs::find_by_address(&address, &db_pool).await?;
+                if let Some(sync) = sync_log {
+                    // Only update if we haven't already synced this block
+                    if sync.last_synced_block_number < block_number as i64 {
+                        sync.update_last_synced_block_number(block_number, &db_pool).await
+                            .map_err(|e| AppError::Database(e))?;
+                        
+                        // Store block hash (use cached hash from verification or block fetch)
+                        if let Some(hash) = last_verified_hash.or_else(|| log_block_hash.map(|h| h.into())) {
+                            sqlx::query(
+                                "UPDATE evm_sync_logs SET last_synced_block_hash = $1 WHERE address = $2"
+                            )
+                            .bind(&hash[..])
+                            .bind(&sync.address[..])
+                            .execute(&db_pool)
+                            .await
+                            .map_err(|e| AppError::Database(e))?;
                         }
                     }
                 }
