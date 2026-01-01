@@ -2197,6 +2197,7 @@ name = "listener"
 version = "0.0.7"
 dependencies = [
  "alloy",
+ "futures-util",
  "indexer-db",
  "reqwest",
  "serde",

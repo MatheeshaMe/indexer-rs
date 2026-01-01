@@ -1,4 +1,4 @@
-use std::{env, str::FromStr, time::Duration};
+use std::{env, str::FromStr, time::Duration, fs::OpenOptions, io::Write};
 
 use alloy::{
     eips::BlockNumberOrTag,
@@ -6,6 +6,7 @@ use alloy::{
     providers::{Provider, ProviderBuilder},
     rpc::types::{Filter, BlockTransactionsKind},
 };
+use futures_util::StreamExt;
 use indexer_db::entity::{blocks::Block, evm_logs::EvmLogs, evm_sync_logs::EvmSyncLogs};
 use sqlx::{Pool, Postgres};
 use tokio::time::sleep;
@@ -699,61 +700,248 @@ async fn try_ws_connection(
         println!("Catchup complete, now listening for new blocks via WebSocket...");
     }
 
-    // Live mode: Only process blocks up to safe_head (finalized blocks)
-    // This prevents processing unfinalized blocks that might get reorged
-    let mut last_seen_block = *current_block - 1;
-    let mut consecutive_no_new_blocks = 0;
+    // Live mode: Use WebSocket subscriptions for push-based event processing
+    // Subscribe to logs from the contract address
+    println!("Subscribing to logs for contract {address} via WebSocket...");
     
-    loop {
-        // Get latest block and calculate safe head
-        let latest_block = provider
-            .get_block_number()
-            .await
-            .map_err(|e| AppError::RPCError(format!("Failed to get block number: {e}")))?;
-
-        let safe_head = get_safe_head(&provider).await?;
+    let contract_address = Address::from_str(&address)
+        .map_err(|e| AppError::InvalidAddress(format!("Invalid Address {e}")))?;
+    
+    // Create filter for contract address
+    let filter = Filter::new()
+        .address(contract_address)
+        .from_block(BlockNumberOrTag::Latest);
+    
+    // Subscribe to logs (push-based, not polling)
+    let subscription = provider
+        .subscribe_logs(&filter)
+        .await
+        .map_err(|e| AppError::WebSocketError(format!("Failed to subscribe to logs: {e}")))?;
+    
+    println!("Successfully subscribed to logs via WebSocket (push-based)");
+    
+    // Convert subscription to stream
+    let mut log_stream = subscription.into_stream();
+    
+    // Track last verified block to avoid repeated checks
+    let mut last_verified_block: Option<u64> = None;
+    let mut last_verified_hash: Option<[u8; 32]> = None;
+    
+    // Process logs as they arrive (push-based)
+    while let Some(log) = log_stream.next().await {
+        // Get block number from log
+        let block_number = log.block_number
+            .ok_or_else(|| AppError::RPCError("Log missing block number".into()))?;
         
-        // Only process up to safe_head (conservative approach)
-        // This ensures we only process finalized blocks, reducing reorg risk
-        let to_block = std::cmp::min(latest_block, safe_head);
-
-        if to_block > last_seen_block {
-            // New finalized block(s) available
-            consecutive_no_new_blocks = 0;
-            let from_block = *current_block;
-
-            match fetch_and_save_logs_ws(chain_id, db_pool.clone(), address.clone(), from_block, to_block, &provider)
-                .await
-            {
-                Ok(last_synced) => {
-                    *current_block = last_synced + 1;
-                    last_seen_block = last_synced;
-                    let blocks_behind = latest_block.saturating_sub(last_synced);
-                    println!(
-                        "New finalized block {} synced for {address} (via WebSocket, {} blocks behind latest)",
-                        last_synced,
-                        blocks_behind
-                    );
+        // CRITICAL: Skip logs from blocks this already rolled back from
+        // This prevents processing stale logs from reorged blocks
+        if block_number < *current_block {
+            // This log is from a block already processed or rolled back from
+            // Skip it - it's either stale or from a reorged block that already handled
+            continue;
+        }
+        
+        // Check if log is removed (reorg detection)
+        if log.removed {
+            // Mark existing logs for this block as removed
+            let address_array: [u8; 20] = contract_address.into();
+            let mut tx = db_pool.begin().await?;
+            
+            let marked = EvmLogs::mark_removed_by_block_range(
+                block_number,
+                block_number,
+                &address_array,
+                &mut *tx,
+            )
+            .await
+            .map_err(|e| AppError::Database(e))?;
+            
+            tx.commit().await?;
+            
+            if marked > 0 {
+                println!("Reorg detected: Marked {} logs as removed for block {} (via subscription removed field)", marked, block_number);
+            }
+            
+            // Reset verification cache for this block
+            if last_verified_block == Some(block_number) {
+                last_verified_block = None;
+                last_verified_hash = None;
+            }
+            
+            continue; // Skip processing removed logs
+        }
+        
+        // Normal log - verify block hash continuity (only once per block)
+        let needs_verification = last_verified_block != Some(block_number);
+        
+        if needs_verification {
+            // #region agent log
+            let log_path = "/home/hpms/web3-indexing/indexer-rs/.cursor/debug.log";
+            let mut log_file = OpenOptions::new().create(true).append(true).open(log_path).ok();
+            if let Some(ref mut f) = log_file {
+                let _ = writeln!(f, r#"{{"sessionId":"debug-session","runId":"pre-fix","hypothesisId":"A","location":"listener/src/service.rs:777","message":"Verification start","data":{{"block_number":{},"address":"{}"}},"timestamp":{}}}"#, block_number, address, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
+            }
+            // #endregion
+            
+            let sync_log = EvmSyncLogs::find_by_address(&address, &db_pool).await?;
+            let last_synced_block = sync_log.as_ref().map(|s| s.last_synced_block_number).unwrap_or(-1);
+            let expected_parent_hash = sync_log
+                .as_ref()
+                .and_then(|s| s.last_synced_block_hash.as_ref())
+                .and_then(|h| {
+                    if h.len() == 32 {
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(h);
+                        Some(arr)
+                    } else {
+                        None
+                    }
+                });
+            
+            // #region agent log
+            if let Some(ref mut f) = log_file {
+                let expected_hex = expected_parent_hash.map(|h| format!("0x{}", hex::encode(h))).unwrap_or_else(|| "None".to_string());
+                let _ = writeln!(f, r#"{{"sessionId":"debug-session","runId":"pre-fix","hypothesisId":"A","location":"listener/src/service.rs:790","message":"Sync state","data":{{"last_synced_block":{},"expected_parent_hash":"{}"}},"timestamp":{}}}"#, last_synced_block, expected_hex, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
+            }
+            // #endregion
+            
+            // Check if parent block exists in blocks table
+            let parent_block_num = block_number.saturating_sub(1);
+            let parent_block_in_db = Block::find_by_number(parent_block_num, &db_pool).await.ok().flatten();
+            
+            // #region agent log
+            if let Some(ref mut f) = log_file {
+                let parent_hash_in_db = parent_block_in_db.as_ref().map(|b| format!("0x{}", hex::encode(b.block_hash))).unwrap_or_else(|| "None".to_string());
+                let _ = writeln!(f, r#"{{"sessionId":"debug-session","runId":"pre-fix","hypothesisId":"B","location":"listener/src/service.rs:795","message":"Parent block check","data":{{"parent_block_num":{},"parent_exists_in_db":{},"parent_hash_in_db":"{}"}},"timestamp":{}}}"#, parent_block_num, parent_block_in_db.is_some(), parent_hash_in_db, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
+            }
+            // #endregion
+            
+            // Verify block hash continuity
+            match verify_block_hash_continuity(
+                &provider,
+                block_number,
+                expected_parent_hash,
+            ).await {
+                Ok((current_hash, _parent_hash)) => {
+                    // Verification successful - cache the result
+                    last_verified_block = Some(block_number);
+                    last_verified_hash = Some(current_hash);
+                }
+                Err(AppError::ReorgDetected(block)) => {
+                    // Reorg detected - handle it properly
+                    eprintln!("Reorg detected at block {} via hash continuity - handling reorg...", block);
+                    
+                    // Mark all logs from the reorged block onwards as removed
+                    let address_array: [u8; 20] = contract_address.into();
+                    let mut tx = db_pool.begin().await?;
+                    
+                    // Roll back to block - 1
+                    let rollback_block = block.saturating_sub(1);
+                    let marked = EvmLogs::mark_removed_by_block_range(
+                        block,
+                        block_number, // Mark all logs up to current block
+                        &address_array,
+                        &mut *tx,
+                    )
+                    .await
+                    .map_err(|e| AppError::Database(e))?;
+                    
+                    // Update sync state to rollback block
+                    let sync_log = EvmSyncLogs::find_by_address(&address, &db_pool).await?;
+                    if let Some(sync) = sync_log {
+                        sync.update_last_synced_block_number(rollback_block, &mut *tx).await
+                            .map_err(|e| AppError::Database(e))?;
+                        
+                        // Clear block hash since we rolled back
+                        sqlx::query(
+                            "UPDATE evm_sync_logs SET last_synced_block_hash = NULL WHERE address = $1"
+                        )
+                        .bind(&sync.address[..])
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| AppError::Database(e))?;
+                    }
+                    
+                    tx.commit().await?;
+                    
+                    if marked > 0 {
+                        println!("Reorg handled: Marked {} logs as removed, rolled back to block {}", marked, rollback_block);
+                    }
+                    
+                    // Reset verification cache
+                    last_verified_block = None;
+                    last_verified_hash = None;
+                    *current_block = rollback_block + 1;
+                    
+                    println!("Reorg handled: Rolled back to block {}, skipping logs from blocks < {}", rollback_block, *current_block);
+                    
+                    // Skip this log - it's from a reorged block
+                    // Future logs from this block will also be skipped by the block_number < current_block check
+                    continue;
                 }
                 Err(e) => {
-                    return Err(e);
+                    eprintln!("Error verifying block hash continuity: {:?}", e);
+                    continue; // Skip this log on error
                 }
             }
-        } else {
-            // No new finalized blocks yet
-            consecutive_no_new_blocks += 1;
-            // Wait for finality (blocks need time to finalize)
-            sleep(Duration::from_secs(1)).await;
-            
-            // Log every 10 seconds if no new finalized blocks
-            if consecutive_no_new_blocks % 10 == 0 {
-                println!(
-                    "⏳ Waiting for finalized blocks... (synced: {}, latest: {}, safe_head: {})", 
-                    last_seen_block, latest_block, safe_head
-                );
+        }
+        
+        // Extract block_hash before moving log
+        let log_block_hash = log.block_hash;
+                    
+        // Save the log (block already verified)
+        match EvmLogs::create(log, &db_pool).await {
+            Ok(_saved_log) => {
+                // Update sync state (only once per block, use cached hash if available)
+                if last_verified_block == Some(block_number) {
+                    let sync_log = EvmSyncLogs::find_by_address(&address, &db_pool).await?;
+                    if let Some(sync) = sync_log {
+                        // Only update if we haven't already synced this block
+                        if sync.last_synced_block_number < block_number as i64 {
+                            sync.update_last_synced_block_number(block_number, &db_pool).await
+                                .map_err(|e| AppError::Database(e))?;
+                            
+                            // Store block hash (use cached hash from verification)
+                            if let Some(hash) = last_verified_hash.or_else(|| log_block_hash.map(|h| h.into())) {
+                                sqlx::query(
+                                    "UPDATE evm_sync_logs SET last_synced_block_hash = $1 WHERE address = $2"
+                                )
+                                .bind(&hash[..])
+                                .bind(&sync.address[..])
+                                .execute(&db_pool)
+                                .await
+                                .map_err(|e| AppError::Database(e))?;
+                                
+                                // Store block in blocks table for tracking
+                                if let Ok(Some(block)) = provider
+                                    .get_block_by_number(BlockNumberOrTag::Number(block_number), BlockTransactionsKind::Full)
+                                    .await
+                                {
+                                    let parent_hash: [u8; 32] = block.header.parent_hash.into();
+                                    if let Err(e) = Block::create_or_update(block_number, hash, parent_hash, &db_pool).await {
+                                        eprintln!("Warning: Failed to store block {} in blocks table: {}", block_number, e);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                println!("Received and saved log from block {} (via WebSocket subscription)", block_number);
+                if *current_block <= block_number {
+                    *current_block = block_number + 1;
+                }
+            }
+            Err(e) => {
+                eprintln!("Failed to save log from subscription: {:?}", e);
+                // Continue processing other logs
             }
         }
     }
+    
+    // Stream ended (shouldn't happen, but handle gracefully)
+    eprintln!("WebSocket subscription stream ended unexpectedly");
+    Err(AppError::WebSocketError("Subscription stream ended".into()))
 }
 
 impl ListenerService {
