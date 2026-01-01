@@ -15,9 +15,24 @@ pub enum AppError {
     #[error("RPC error: {0}")]
     RPCError(String),
 
+    #[error("WebSocket error: {0}")]
+    #[allow(dead_code)] // Reserved for future WebSocket implementation
+    WebSocketError(String),
+
     #[error("Invalid address: ${0}")]
     InvalidAddress(String),
 
     #[error("Not saved Error {0}")]
-    EVMLog(String),    
+    EVMLog(String),
+
+    #[error("Backfill complete - reached safe head")]
+    BackfillComplete,
+
+    #[error("Reorg detected at block {0}")]
+    #[allow(dead_code)] // Reserved for future use if needed
+    ReorgDetected(u64),
+
+    #[error("Block hash mismatch - possible reorg")]
+    #[allow(dead_code)] // Reserved for future use
+    BlockHashMismatch,
 }

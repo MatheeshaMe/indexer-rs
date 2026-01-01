@@ -8,9 +8,13 @@ edition = '2021'
 alloy = { workspace = true }
 tokio = { workspace = true }
 indexer-db = { path = '../libs/indexer-db', version = '0.0.10' }
+indexer-metrics = { path = '../libs/indexer-metrics', version = '0.1.0' }
 thiserror = { workspace = true }
-tower = { version = '0.5.1', features = ['limit', 'util'] }
+tower = { workspace = true }
 sqlx = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 reqwest = { version = '0.12.12', features = ['json'] }
+futures-util = "0.3"
+axum = { workspace = true }
+tower-http = { workspace = true }

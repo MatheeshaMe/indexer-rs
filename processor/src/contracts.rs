@@ -32,6 +32,11 @@ impl ContractRegistry {
         })
     }
 
+    pub fn get_contract_name(&self, address: [u8; 20]) -> Option<String> {
+        let log_address = utils::vec_to_hex(address.to_vec());
+        self.registry.get(&log_address).cloned()
+    }
+
     pub fn get_processor(&self, address: [u8; 20]) -> Result<impl ContractHandler, AppError> {
         let log_address = utils::vec_to_hex(address.to_vec());
         let contract = self.registry.get(&log_address);

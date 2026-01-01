@@ -1,6 +1,7 @@
 use sqlx::{Executor, Postgres, types::{BigDecimal, chrono}};
 
 #[derive(sqlx::FromRow,Debug,Clone)]
+
 pub struct UsdtTransfers{
     pub id: i64,
     pub tx_hash: [u8; 32],
@@ -21,10 +22,14 @@ impl UsdtTransfers {
         let query = r#"
         INSERT INTO usdt_transfers (tx_hash, block_number, block_timestamp, from_address, to_address, value, classification, chain_id)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-        ON CONFLICT (tx_hash, from_address, to_address, value, block_number) DO NOTHING
+        ON CONFLICT (tx_hash, from_address, to_address, value, block_number) 
+        DO UPDATE SET 
+            block_timestamp = EXCLUDED.block_timestamp,
+            classification = EXCLUDED.classification
         RETURNING *
     "#;
         println!("query {}",query);
+        
         sqlx::query_as::<_, UsdtTransfers>(query)
             .bind(transfer.tx_hash)
             .bind(transfer.block_number)
@@ -50,7 +55,22 @@ impl UsdtTransfers {
             .fetch_one(connection)
             .await
     }
-    // pub async fn upate_usdt_transfer<'c,E>(&self,tx_hash: Vec<u8>,connection: E) -> Result<UsdtTransfers,sqlx::Error> where E: Executor<'c,Database=Postgres>{
-    //     let query = "UPDATE usdt_transfers SET"
-    // }
+
+    /// Delete transfers by transaction hash and block number (for reorg cleanup)
+    pub async fn delete_by_tx_hash_and_block<'c, E>(
+        tx_hash: &[u8; 32],
+        block_number: &BigDecimal,
+        connection: E,
+    ) -> Result<u64, sqlx::Error>
+    where
+        E: Executor<'c, Database = Postgres>,
+    {
+        let result = sqlx::query("DELETE FROM usdt_transfers WHERE tx_hash = $1 AND block_number = $2")
+            .bind(&tx_hash[..])
+            .bind(block_number)
+            .execute(connection)
+            .await?;
+
+        Ok(result.rows_affected() as u64)
+    }
 }
